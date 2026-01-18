@@ -1,0 +1,10 @@
+package com.sec.android.app.sbrowser.models;
+
+/**
+ * Created by K2Y on 2017. 7. 10..
+ */
+
+public class BaseData {
+    public int status;
+    public ErrorData error;
+}

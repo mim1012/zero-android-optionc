@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <string name="android_auto_update_dialog_title">새버전발견</string>
+
+    <string name="android_auto_update_notify_ticker">새버전발견,업그레이드하려면 클릭하십시오</string>
+    <string name="android_auto_update_notify_content">새버전발견,업그레이드하려면 클릭하십시오</string>
+
+    <string name="android_auto_update_dialog_btn_download">다운로드</string>
+    <string name="android_auto_update_dialog_btn_cancel">취소</string>
+
+    <string name="android_auto_update_toast_no_new_update">이미 최신버전으로 업데이트 되었습니다.</string>
+
+    <string name="android_auto_update_download_progress">다운로드 중: %1$d%%</string>
+
+    <string name="android_auto_update_dialog_checking">버전 확인 중</string>
+
+
+</resources>

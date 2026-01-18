@@ -1,0 +1,4 @@
+rootProject.name='Zero'
+include ':library'
+include ':openCVLibrary344'
+include ':app'

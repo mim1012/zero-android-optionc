@@ -1,0 +1,49 @@
+apply plugin: 'com.android.library'
+
+
+android {
+    compileSdkVersion 29
+
+    defaultConfig {
+        minSdkVersion 14
+        targetSdkVersion 29
+    }
+    namespace 'com.loveplusplus.update'
+
+
+//    publishNonDefault true
+//
+//    flavorDimensions "mode", "build"
+//    productFlavors {
+//        dist {
+//            dimension "build"
+//            buildConfigField("String", "SERVER_URL", "\"http://52.78.170.180/admin/api/\"")
+//            buildConfigField("int", "MAX_DATA_COUNT", "200")
+//        }
+//        dev {
+//            dimension "build"
+//            buildConfigField("String", "SERVER_URL", "\"http://c84228d3.ngrok.io/api/\"")
+//            buildConfigField("int", "MAX_DATA_COUNT", "3")
+//        }
+//
+//        parent {
+//            dimension "mode"
+//            buildConfigField("int", "APP_TYPE", "1")
+//        }
+//
+//        child {
+//            dimension "mode"
+//            buildConfigField("int", "APP_TYPE", "2")
+//        }
+//    }
+
+    //库项目不生成 BuildConfig
+    libraryVariants.all {
+        it.generateBuildConfig.enabled = false
+    }
+}
+
+
+dependencies {
+    implementation 'androidx.legacy:legacy-support-v4:1.0.0'
+}
