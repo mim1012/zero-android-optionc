@@ -19,6 +19,7 @@ import com.zero.traffic.engine.ScriptEngine;
 import com.zero.traffic.model.Scenario;
 import com.zero.traffic.model.StepResult;
 import com.zero.traffic.model.TaskInfo;
+import com.zero.traffic.network.ChromeManager;
 import com.zero.traffic.network.GroupManager;
 import com.zero.traffic.network.NetworkUtils;
 import com.zero.traffic.server.ApiClient;
@@ -124,17 +125,25 @@ public class TrafficService extends Service {
             Logger.w("그룹 미등록 — 독립 모드로 실행");
         }
 
-        // 3. WebView 초기화 (메인 스레드에서)
+        // 3. Chrome 확인/설치 (WebView TLS 핑거프린트 최신화)
+        ChromeManager chromeManager = new ChromeManager(this, api);
+        if (chromeManager.ensureChromeReady()) {
+            Logger.i("Chrome 준비 완료 (v" + chromeManager.getInstalledChromeVersion() + ")");
+        } else {
+            Logger.w("Chrome 미준비 — 기본 WebView로 진행");
+        }
+
+        // 4. WebView 초기화 (메인 스레드에서)
         initWebView();
 
-        // 4. 매니저 초기화
+        // 5. 매니저 초기화
         taskManager = new TaskManager(api, deviceId);
         scenarioManager = new ScenarioManager(this, api, deviceId);
         scriptEngine = new ScriptEngine(this, api);
         captchaProxy = new CaptchaProxy(api, deviceId);
         runner = new ScenarioRunner(webView, captchaProxy, scriptEngine);
 
-        // 5. 서버 동기화
+        // 6. 서버 동기화
         scenarioManager.sync();
         scriptEngine.sync();
 
