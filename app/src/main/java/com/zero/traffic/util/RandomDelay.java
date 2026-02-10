@@ -19,9 +19,13 @@ public class RandomDelay {
         return between(range[0], range[1]);
     }
 
-    /** ms 만큼 Thread.sleep (InterruptedException 무시) */
+    /** ms 만큼 Thread.sleep (Interrupted 시 interrupt 플래그 복구) */
     public static void sleep(int ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /** min~max 사이 랜덤 sleep */

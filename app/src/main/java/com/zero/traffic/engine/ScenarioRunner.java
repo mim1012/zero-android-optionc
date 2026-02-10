@@ -70,6 +70,7 @@ public class ScenarioRunner {
                             return StepResult.fail("CAPTCHA 해결 실패 at " + step.getId());
                         }
                         Logger.i("CAPTCHA 해결 성공");
+                        i--; // 현재 스텝을 다시 실행
                         continue;
                     }
                 }

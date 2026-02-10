@@ -137,11 +137,13 @@ public class ChromeManager {
                 byte[] buffer = new byte[8192];
                 int read;
                 long total = 0;
+                long nextProgressLog = 10L * 1024 * 1024;
                 while ((read = in.read(buffer)) != -1) {
                     out.write(buffer, 0, read);
                     total += read;
-                    if (total % (10 * 1024 * 1024) == 0) { // 10MB마다 로그
+                    if (total >= nextProgressLog) { // 10MB 단위 진행 로그
                         Logger.i("[Chrome] 다운로드 중: " + (total / 1024 / 1024) + "MB");
+                        nextProgressLog += 10L * 1024 * 1024;
                     }
                 }
                 Logger.i("[Chrome] 다운로드 완료: " + (total / 1024 / 1024) + "MB");

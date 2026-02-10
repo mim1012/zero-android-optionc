@@ -6,7 +6,9 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.provider.Settings;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
@@ -29,6 +31,8 @@ import com.zero.traffic.util.RandomDelay;
 
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 트래픽 포그라운드 서비스 — 메인 루프
@@ -44,15 +48,16 @@ public class TrafficService extends Service {
 
     private ExecutorService worker;
     private volatile boolean running = false;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    private WebView webView;
-    private ApiClient api;
-    private TaskManager taskManager;
-    private ScenarioManager scenarioManager;
-    private ScriptEngine scriptEngine;
-    private CaptchaProxy captchaProxy;
-    private ScenarioRunner runner;
-    private GroupManager groupManager;
+    private volatile WebView webView;
+    private volatile ApiClient api;
+    private volatile TaskManager taskManager;
+    private volatile ScenarioManager scenarioManager;
+    private volatile ScriptEngine scriptEngine;
+    private volatile CaptchaProxy captchaProxy;
+    private volatile ScenarioRunner runner;
+    private volatile GroupManager groupManager;
 
     private String deviceId;
 
@@ -88,6 +93,7 @@ public class TrafficService extends Service {
                 mainLoop();
             } catch (Exception e) {
                 Logger.e("서비스 오류", e);
+                stopSelf();
             }
         });
 
@@ -134,7 +140,9 @@ public class TrafficService extends Service {
         }
 
         // 4. WebView 초기화 (메인 스레드에서)
-        initWebView();
+        if (!initWebView()) {
+            throw new IllegalStateException("WebView 초기화 실패");
+        }
 
         // 5. 매니저 초기화
         taskManager = new TaskManager(api, deviceId);
@@ -157,26 +165,47 @@ public class TrafficService extends Service {
     /**
      * WebView 초기화 (메인 스레드)
      */
-    private void initWebView() {
-        // 메인 스레드에서 WebView 생성 필요
-        android.os.Handler mainHandler = new android.os.Handler(android.os.Looper.getMainLooper());
-        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+    private boolean initWebView() {
+        CountDownLatch latch = new CountDownLatch(1);
+        final boolean[] created = {false};
 
         mainHandler.post(() -> {
-            webView = new WebView(TrafficService.this);
-            WebSettings settings = webView.getSettings();
-            settings.setJavaScriptEnabled(true);
-            settings.setDomStorageEnabled(true);
-            settings.setDatabaseEnabled(true);
-            settings.setUserAgentString(
-                "Mozilla/5.0 (Linux; Android " + Build.VERSION.RELEASE + "; " + Build.MODEL +
-                ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
-            );
-            webView.setWebViewClient(new WebViewClient());
-            latch.countDown();
+            try {
+                webView = new WebView(TrafficService.this);
+                WebSettings settings = webView.getSettings();
+                settings.setJavaScriptEnabled(true);
+                settings.setDomStorageEnabled(true);
+                settings.setDatabaseEnabled(true);
+                settings.setAllowFileAccess(false);
+                settings.setAllowContentAccess(false);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+                    settings.setAllowFileAccessFromFileURLs(false);
+                    settings.setAllowUniversalAccessFromFileURLs(false);
+                }
+                settings.setUserAgentString(
+                    "Mozilla/5.0 (Linux; Android " + Build.VERSION.RELEASE + "; " + Build.MODEL +
+                    ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+                );
+                webView.setWebViewClient(new WebViewClient());
+                created[0] = true;
+            } catch (Exception e) {
+                Logger.e("WebView 초기화 실패: " + e.getMessage());
+            } finally {
+                latch.countDown();
+            }
         });
 
-        try { latch.await(); } catch (InterruptedException ignored) {}
+        try {
+            if (!latch.await(10, TimeUnit.SECONDS)) {
+                Logger.e("WebView 초기화 타임아웃");
+                return false;
+            }
+            return created[0] && webView != null;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Logger.w("WebView 초기화 인터럽트");
+            return false;
+        }
     }
 
     /**
@@ -185,7 +214,7 @@ public class TrafficService extends Service {
     private void mainLoop() {
         long lastSync = System.currentTimeMillis();
 
-        while (running) {
+        while (running && !Thread.currentThread().isInterrupted()) {
             try {
                 // 자동 업데이트 (1시간마다)
                 if (System.currentTimeMillis() - lastSync > 3600_000) {
@@ -231,6 +260,10 @@ public class TrafficService extends Service {
 
             } catch (Exception e) {
                 Logger.e("루프 오류: " + e.getMessage());
+                if (Thread.currentThread().isInterrupted()) {
+                    Logger.i("워커 인터럽트 감지 — 루프 종료");
+                    break;
+                }
                 RandomDelay.sleepBetween(30000, 60000);
             }
         }
@@ -274,6 +307,29 @@ public class TrafficService extends Service {
         if (worker != null) worker.shutdownNow();
         if (runner != null) runner.cancel();
         if (groupManager != null) groupManager.cleanup();
+        WebView currentWebView = webView;
+        if (currentWebView != null) {
+            CountDownLatch destroyLatch = new CountDownLatch(1);
+            mainHandler.post(() -> {
+                try {
+                    currentWebView.stopLoading();
+                    currentWebView.loadUrl("about:blank");
+                    currentWebView.clearHistory();
+                    currentWebView.removeAllViews();
+                    currentWebView.destroy();
+                } catch (Exception e) {
+                    Logger.w("WebView 해제 실패: " + e.getMessage());
+                } finally {
+                    destroyLatch.countDown();
+                }
+            });
+            try {
+                destroyLatch.await(3, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            webView = null;
+        }
         super.onDestroy();
     }
 

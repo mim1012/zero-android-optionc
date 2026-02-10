@@ -93,7 +93,7 @@ public class GroupManager {
         hotspotManager = new HotspotManager(context);
 
         String ssid = "zero-g" + groupId;
-        String password = "zero" + String.format("%04d", groupId);
+        String password = buildGroupPassword();
 
         boolean success = hotspotManager.enableHotspot(ssid, password);
         if (success) {
@@ -110,7 +110,7 @@ public class GroupManager {
         wifiConnector = new WifiConnector(context);
 
         String ssid = "zero-g" + groupId;
-        String password = "zero" + String.format("%04d", groupId);
+        String password = buildGroupPassword();
 
         // 연결 시도 (최대 30초)
         boolean connected = wifiConnector.connectToHotspot(ssid, password, 30000);
@@ -134,6 +134,14 @@ public class GroupManager {
         } catch (Exception e) {
             Logger.w("IP 보고 실패: " + e.getMessage());
         }
+    }
+
+    private String buildGroupPassword() {
+        String password = "zero" + String.format("%04d", Math.max(groupId, 0));
+        if (password.length() < 8) {
+            password = (password + "00000000").substring(0, 8);
+        }
+        return password;
     }
 
     /**

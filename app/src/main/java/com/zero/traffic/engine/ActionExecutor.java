@@ -1,11 +1,15 @@
 package com.zero.traffic.engine;
 
+import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.view.MotionEvent;
-import android.webkit.ValueCallback;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
+import android.webkit.WebViewClient;
 
 import com.zero.traffic.model.Step;
 import com.zero.traffic.model.StepResult;
@@ -37,26 +41,51 @@ public class ActionExecutor {
     public StepResult navigate(Step step) {
         String url = step.getString("url");
         if (url.isEmpty()) return StepResult.fail("navigate: url empty");
+        Uri parsed = Uri.parse(url);
+        String scheme = parsed.getScheme();
+        if (scheme == null || (!"http".equalsIgnoreCase(scheme) && !"https".equalsIgnoreCase(scheme))) {
+            return StepResult.fail("navigate: unsupported scheme: " + url);
+        }
 
         Logger.step(step.getId(), "navigate", url);
         CompletableFuture<Void> future = new CompletableFuture<>();
+        long timeout = step.getLong("timeout", 30000);
 
         mainHandler.post(() -> {
+            if (isWebViewDestroyed()) {
+                future.completeExceptionally(new IllegalStateException("webview destroyed"));
+                return;
+            }
+
+            webView.setWebViewClient(new WebViewClient() {
+                @Override
+                public void onPageFinished(WebView view, String loadedUrl) {
+                    if (!future.isDone()) {
+                        future.complete(null);
+                    }
+                }
+
+                @Override
+                public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                    if (request != null && request.isForMainFrame() && !future.isDone()) {
+                        CharSequence description = error != null ? error.getDescription() : null;
+                        future.completeExceptionally(
+                                new IllegalStateException(description != null ? description.toString() : "load error"));
+                    }
+                }
+            });
+
             webView.loadUrl(url);
-            // WebViewClient.onPageFinished에서 future.complete() 호출 필요
-            // 여기서는 간단히 타이머로 대기
-            mainHandler.postDelayed(() -> future.complete(null), 1000);
         });
 
         try {
-            long timeout = step.getLong("timeout", 30000);
             future.get(timeout, TimeUnit.MILLISECONDS);
         } catch (Exception e) {
-            return StepResult.fail("navigate timeout: " + url);
+            return StepResult.fail("navigate failed: " + e.getMessage());
         }
 
         // domcontentloaded 대기
-        RandomDelay.sleepBetween(1000, 2000);
+        RandomDelay.sleepBetween(300, 700);
         return StepResult.success();
     }
 
@@ -111,21 +140,22 @@ public class ActionExecutor {
     private String buildTapJS(String selector, String fallback, String fallbackText, boolean removeTarget) {
         StringBuilder sb = new StringBuilder();
         sb.append("(function(){");
-        sb.append("var el=document.querySelector('").append(escapeJS(selector)).append("');");
+        sb.append("var el=document.querySelector(").append(jsQuote(selector)).append(");");
         if (!fallback.isEmpty()) {
-            sb.append("if(!el) el=document.querySelector('").append(escapeJS(fallback)).append("');");
+            sb.append("if(!el) el=document.querySelector(").append(jsQuote(fallback)).append(");");
         }
         if (!fallbackText.isEmpty()) {
             sb.append("if(!el){var links=document.querySelectorAll('a');");
             sb.append("for(var i=0;i<links.length;i++){");
-            sb.append("if(links[i].textContent.trim().startsWith('").append(escapeJS(fallbackText)).append("')){el=links[i];break;}}}");
+            sb.append("if(links[i].textContent.trim().startsWith(").append(jsQuote(fallbackText)).append(")){el=links[i];break;}}}");
         }
         sb.append("if(!el) return 'null';");
         if (removeTarget) {
             sb.append("el.removeAttribute('target');");
         }
         sb.append("var r=el.getBoundingClientRect();");
-        sb.append("return JSON.stringify({x:r.x+r.width/2,y:r.y+r.height/2});");
+        sb.append("var dpr=window.devicePixelRatio||1;");
+        sb.append("return JSON.stringify({x:(r.x+r.width/2)*dpr,y:(r.y+r.height/2)*dpr});");
         sb.append("})()");
         return sb.toString();
     }
@@ -143,12 +173,12 @@ public class ActionExecutor {
         Logger.step(step.getId(), "humanType", text.length() > 30 ? text.substring(0, 30) + "..." : text);
 
         // 요소 찾기 + 포커스
-        String findJS = String.format(
-                "(function(){var el=document.querySelector('%s');" +
-                "if(!el && '%s') el=document.querySelector('%s');" +
+        String selectorLiteral = jsQuote(selector);
+        String fallbackLiteral = jsQuote(fallback);
+        String findJS = "(function(){var el=document.querySelector(" + selectorLiteral + ");" +
+                "if(!el && " + fallbackLiteral + ") el=document.querySelector(" + fallbackLiteral + ");" +
                 "if(!el) return 'not_found';" +
-                "el.click();el.focus();return 'found';})()",
-                escapeJS(selector), escapeJS(fallback), escapeJS(fallback));
+                "el.click();el.focus();return 'found';})()";
 
         String found = evalJSSync(findJS, 5000);
         if (!"found".equals(found)) {
@@ -159,22 +189,22 @@ public class ActionExecutor {
 
         // clearFirst
         if (clearFirst) {
-            evalJSSync(String.format(
-                    "(function(){var el=document.querySelector('%s');if(el){el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));};})()",
-                    escapeJS(selector)), 3000);
+            evalJSSync(
+                    "(function(){var el=document.querySelector(" + selectorLiteral + ");" +
+                    "if(el){el.value='';el.dispatchEvent(new Event('input',{bubbles:true}));}})()",
+                    3000);
             RandomDelay.sleepBetween(100, 200);
         }
 
         // 한 글자씩 타이핑 (dispatchEvent로 실제 키 이벤트)
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
-            String typeJS = String.format(
-                    "(function(){var el=document.querySelector('%s');" +
-                    "if(el){el.value+='%s';" +
+            String cLiteral = jsQuote(String.valueOf(c));
+            String typeJS = "(function(){var el=document.querySelector(" + selectorLiteral + ");" +
+                    "if(el){el.value+=" + cLiteral + ";" +
                     "el.dispatchEvent(new Event('input',{bubbles:true}));" +
-                    "el.dispatchEvent(new KeyboardEvent('keydown',{key:'%s',bubbles:true}));" +
-                    "el.dispatchEvent(new KeyboardEvent('keyup',{key:'%s',bubbles:true}));};})()",
-                    escapeJS(selector), escapeJSChar(c), escapeJSChar(c), escapeJSChar(c));
+                    "el.dispatchEvent(new KeyboardEvent('keydown',{key:" + cLiteral + ",bubbles:true}));" +
+                    "el.dispatchEvent(new KeyboardEvent('keyup',{key:" + cLiteral + ",bubbles:true}));}})()";
 
             evalJSSync(typeJS, 2000);
             RandomDelay.sleep(RandomDelay.between(charDelay[0], charDelay[1]));
@@ -193,10 +223,11 @@ public class ActionExecutor {
         boolean waitNav = step.getBoolean("waitNav", false);
         Logger.step(step.getId(), "press", key);
 
-        String js = String.format(
-                "document.dispatchEvent(new KeyboardEvent('keydown',{key:'%s',code:'%s',bubbles:true}));" +
-                "document.dispatchEvent(new KeyboardEvent('keyup',{key:'%s',code:'%s',bubbles:true}));",
-                escapeJS(key), escapeJS(key), escapeJS(key), escapeJS(key));
+        String keyLiteral = jsQuote(key);
+        String js = "document.dispatchEvent(new KeyboardEvent('keydown',{key:" + keyLiteral +
+                ",code:" + keyLiteral + ",bubbles:true}));" +
+                "document.dispatchEvent(new KeyboardEvent('keyup',{key:" + keyLiteral +
+                ",code:" + keyLiteral + ",bubbles:true}));";
 
         // Enter는 form submit 시뮬레이션
         if ("Enter".equals(key)) {
@@ -281,8 +312,9 @@ public class ActionExecutor {
         // N번째 상품 찾기
         String findJS = String.format(
                 "(function(){var list=[];var seq=0;" +
+                "var re=new RegExp(%s);" +
                 "document.querySelectorAll('a[data-shp-contents-id]').forEach(function(a){" +
-                "if(/%s/.test(a.getAttribute('data-shp-inventory')||''))return;" +
+                "if(re.test(a.getAttribute('data-shp-inventory')||''))return;" +
                 "seq++;list.push({mid:a.getAttribute('data-shp-contents-id')||'',i:seq});});" +
                 "var t=list.find(function(p){return p.i===%d;});" +
                 "if(!t)return 'null';" +
@@ -290,8 +322,9 @@ public class ActionExecutor {
                 "if(!el)return 'null';" +
                 "el.scrollIntoView({block:'center',behavior:'smooth'});" +
                 "var r=el.getBoundingClientRect();" +
-                "return JSON.stringify({x:r.x+r.width/2,y:r.y+r.height/2,mid:t.mid});})()",
-                escapeJS(exclude), index);
+                "var dpr=window.devicePixelRatio||1;" +
+                "return JSON.stringify({x:(r.x+r.width/2)*dpr,y:(r.y+r.height/2)*dpr,mid:t.mid});})()",
+                jsQuote(exclude), index);
 
         // 스크롤 후 대기
         RandomDelay.sleepBetween(500, 1000);
@@ -387,15 +420,25 @@ public class ActionExecutor {
     private String evalJSSync(String js, long timeoutMs) {
         CompletableFuture<String> future = new CompletableFuture<>();
 
-        mainHandler.post(() -> webView.evaluateJavascript(js, value -> {
-            // value는 JSON 인코딩된 문자열 ("\"result\"" 형태)
-            if (value != null && value.startsWith("\"") && value.endsWith("\"")) {
-                value = value.substring(1, value.length() - 1)
-                        .replace("\\\"", "\"")
-                        .replace("\\\\", "\\");
+        mainHandler.post(() -> {
+            if (isWebViewDestroyed()) {
+                future.complete(null);
+                return;
             }
-            future.complete(value);
-        }));
+            try {
+                webView.evaluateJavascript(js, value -> {
+                    // value는 JSON 인코딩된 문자열 ("\"result\"" 형태)
+                    if (value != null && value.startsWith("\"") && value.endsWith("\"")) {
+                        value = value.substring(1, value.length() - 1)
+                                .replace("\\\"", "\"")
+                                .replace("\\\\", "\\");
+                    }
+                    future.complete(value);
+                });
+            } catch (Exception e) {
+                future.complete(null);
+            }
+        });
 
         try {
             return future.get(timeoutMs, TimeUnit.MILLISECONDS);
@@ -412,10 +455,8 @@ public class ActionExecutor {
         mainHandler.post(() -> {
             long now = SystemClock.uptimeMillis();
 
-            // WebView 스케일 보정
-            float scale = webView.getScale();
-            float screenX = x * scale;
-            float screenY = y * scale;
+            float screenX = x;
+            float screenY = y;
 
             MotionEvent down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, screenX, screenY, 0);
             MotionEvent up = MotionEvent.obtain(now, now + 80, MotionEvent.ACTION_UP, screenX, screenY, 0);
@@ -429,14 +470,11 @@ public class ActionExecutor {
         RandomDelay.sleepBetween(100, 200);
     }
 
-    private String escapeJS(String s) {
-        if (s == null) return "";
-        return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "");
+    private boolean isWebViewDestroyed() {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && webView.isDestroyed();
     }
 
-    private String escapeJSChar(char c) {
-        if (c == '\'') return "\\'";
-        if (c == '\\') return "\\\\";
-        return String.valueOf(c);
+    private String jsQuote(String s) {
+        return JSONObject.quote(s == null ? "" : s);
     }
 }

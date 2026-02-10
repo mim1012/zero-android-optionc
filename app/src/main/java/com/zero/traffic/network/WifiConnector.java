@@ -49,6 +49,7 @@ public class WifiConnector {
      */
     public boolean connectToHotspot(String ssid, String password, long timeoutMs) {
         Logger.i("[WiFi] 연결 시도: " + ssid);
+        disconnect(); // 이전 콜백/바인딩 정리
 
         // WiFi 켜기
         if (!wifiManager.isWifiEnabled()) {
@@ -130,11 +131,16 @@ public class WifiConnector {
             connManager.requestNetwork(request, networkCallback);
 
             // 결과 대기
-            latch.await(timeoutMs, TimeUnit.MILLISECONDS);
-            return result[0];
+            boolean completed = latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+            boolean success = completed && result[0];
+            if (!success) {
+                cleanupNetworkCallback();
+            }
+            return success;
 
         } catch (Exception e) {
             Logger.e("[WiFi] Android 10+ 연결 실패: " + e.getMessage());
+            cleanupNetworkCallback();
             return false;
         }
     }
@@ -198,7 +204,22 @@ public class WifiConnector {
     }
 
     private void sleep(int ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void cleanupNetworkCallback() {
+        try {
+            if (networkCallback != null && connManager != null) {
+                connManager.unregisterNetworkCallback(networkCallback);
+            }
+        } catch (Exception ignored) {
+        } finally {
+            networkCallback = null;
+        }
     }
 
     public boolean isConnected() {

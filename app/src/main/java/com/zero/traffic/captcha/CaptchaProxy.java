@@ -1,6 +1,7 @@
 package com.zero.traffic.captcha;
 
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Base64;
@@ -145,9 +146,16 @@ public class CaptchaProxy {
         CompletableFuture<String> future = new CompletableFuture<>();
         mainHandler.post(() -> {
             try {
-                webView.setDrawingCacheEnabled(true);
-                Bitmap bmp = Bitmap.createBitmap(webView.getDrawingCache());
-                webView.setDrawingCacheEnabled(false);
+                int width = webView.getWidth();
+                int height = webView.getHeight();
+                if (width <= 0 || height <= 0) {
+                    future.complete("");
+                    return;
+                }
+
+                Bitmap bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+                Canvas canvas = new Canvas(bmp);
+                webView.draw(canvas);
 
                 ByteArrayOutputStream out = new ByteArrayOutputStream();
                 bmp.compress(Bitmap.CompressFormat.PNG, 90, out);

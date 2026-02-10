@@ -25,6 +25,7 @@ import com.zero.traffic.util.Logger;
 public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "ZeroSettings";
     private static final String KEY_SERVER_URL = "server_url";
+    private static final int MAX_LOG_CHARS = 12000;
 
     private EditText etServerUrl;
     private Button btnStart;
@@ -169,7 +170,11 @@ public class MainActivity extends AppCompatActivity {
         String current = tvLog.getText().toString();
         String time = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
                 .format(new java.util.Date());
-        tvLog.setText("[" + time + "] " + msg + "\n" + current);
+        String next = "[" + time + "] " + msg + "\n" + current;
+        if (next.length() > MAX_LOG_CHARS) {
+            next = next.substring(0, MAX_LOG_CHARS);
+        }
+        tvLog.setText(next);
     }
 
     private int dpToPx(int dp) {

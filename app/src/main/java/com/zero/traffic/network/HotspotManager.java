@@ -10,7 +10,6 @@ import android.os.Looper;
 import com.zero.traffic.util.Logger;
 
 import java.lang.reflect.Method;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -31,7 +30,6 @@ public class HotspotManager {
     private final ConnectivityManager connManager;
 
     private boolean hotspotEnabled = false;
-    private Object tetheringCallback; // for cleanup
 
     public HotspotManager(Context context) {
         this.context = context;
@@ -101,28 +99,8 @@ public class HotspotManager {
             // 대부분의 커스텀 ROM에서는 시스템 설정을 통해야 함
             // 여기서는 기본 핫스팟만 켜고, SSID는 시스템 기본값 사용
 
-            CountDownLatch latch = new CountDownLatch(1);
-            final boolean[] result = {false};
-
-            // OnStartTetheringCallback 동적 생성
             Class<?> callbackClass = Class.forName(
                     "android.net.ConnectivityManager$OnStartTetheringCallback");
-
-            Object callback = java.lang.reflect.Proxy.newProxyInstance(
-                    callbackClass.getClassLoader(),
-                    new Class<?>[]{callbackClass},
-                    (proxy, method, args) -> {
-                        String name = method.getName();
-                        if ("onTetheringStarted".equals(name)) {
-                            result[0] = true;
-                            latch.countDown();
-                        } else if ("onTetheringFailed".equals(name)) {
-                            result[0] = false;
-                            latch.countDown();
-                        }
-                        return null;
-                    }
-            );
 
             // startTethering(int type, boolean showProvisioningUi, callback, handler)
             Method startMethod = connManager.getClass().getDeclaredMethod(
@@ -131,16 +109,26 @@ public class HotspotManager {
             startMethod.setAccessible(true);
 
             Handler handler = new Handler(Looper.getMainLooper());
-            startMethod.invoke(connManager, 0, false, callback, handler);
+            // OnStartTetheringCallback은 hidden abstract class라 동적 Proxy 생성 불가.
+            // null callback으로 시작 요청 후 tether 상태를 polling으로 확인한다.
+            startMethod.invoke(connManager, 0, false, null, handler);
 
-            // 결과 대기 (10초)
-            latch.await(10, TimeUnit.SECONDS);
+            long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(10);
+            hotspotEnabled = false;
+            while (System.currentTimeMillis() < deadline) {
+                if (isTetheringActive()) {
+                    hotspotEnabled = true;
+                    break;
+                }
+                sleep(500);
+            }
 
-            hotspotEnabled = result[0];
             if (hotspotEnabled) {
                 Logger.i("[Hotspot] Oreo+ 핫스팟 ON");
                 // SSID 변경 시도 (reflection, 실패해도 무시)
                 trySetSsid(ssid, password);
+            } else {
+                Logger.w("[Hotspot] Oreo+ 시작 요청 후 활성화 확인 실패");
             }
             return hotspotEnabled;
 
@@ -149,6 +137,20 @@ public class HotspotManager {
             Logger.i("[Hotspot] 수동 설정 필요: 설정 → 핫스팟 → SSID: " + ssid + " / PW: " + password);
             return false;
         }
+    }
+
+    private boolean isTetheringActive() {
+        try {
+            Method getMethod = connManager.getClass().getDeclaredMethod("getTetheredIfaces");
+            getMethod.setAccessible(true);
+            Object result = getMethod.invoke(connManager);
+            if (result instanceof String[]) {
+                return ((String[]) result).length > 0;
+            }
+        } catch (Exception e) {
+            Logger.w("[Hotspot] 상태 확인 실패: " + e.getMessage());
+        }
+        return false;
     }
 
     // ── Android 7 이하 (Legacy) ─────────────────────────
@@ -210,7 +212,11 @@ public class HotspotManager {
     }
 
     private void sleep(int ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     public boolean isHotspotEnabled() {

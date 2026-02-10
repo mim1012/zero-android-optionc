@@ -12,9 +12,11 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.Set;
 
 /**
  * 시나리오 다운로드/캐시/버전관리
@@ -57,12 +59,14 @@ public class ScenarioManager {
             JSONObject resp = api.getJSON("/scenario/active?device_id=" + deviceId);
             JSONArray arr = resp.optJSONArray("scenarios");
             if (arr == null) return;
+            Set<String> activeIds = new HashSet<>();
 
             for (int i = 0; i < arr.length(); i++) {
                 JSONObject s = arr.getJSONObject(i);
                 String id = s.getString("id");
                 int serverVer = s.optInt("version", 1);
                 int weight = s.optInt("weight", 1);
+                activeIds.add(id);
 
                 weights.put(id, weight);
 
@@ -77,6 +81,26 @@ public class ScenarioManager {
                     saveToCache(id, detail.toString(), serverVer);
                     Logger.i("시나리오 업데이트: " + id + " v" + serverVer);
                 }
+            }
+
+            // 서버에서 제거된 시나리오는 로컬 캐시/버전에서도 정리
+            List<String> staleIds = new ArrayList<>();
+            for (String id : cache.keySet()) {
+                if (!activeIds.contains(id)) {
+                    staleIds.add(id);
+                }
+            }
+            if (!staleIds.isEmpty()) {
+                SharedPreferences.Editor editor = prefs.edit();
+                for (String id : staleIds) {
+                    cache.remove(id);
+                    weights.remove(id);
+                    versions.remove(id);
+                    editor.remove("scenario_" + id);
+                    editor.remove("version_" + id);
+                }
+                editor.apply();
+                Logger.i("시나리오 정리: " + staleIds.size() + "개 제거");
             }
 
             Logger.i("시나리오 동기화 완료: " + cache.size() + "개");

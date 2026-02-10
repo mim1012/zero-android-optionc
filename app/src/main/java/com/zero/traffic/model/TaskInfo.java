@@ -37,12 +37,17 @@ public class TaskInfo {
      * 검색 키워드 (short_keyword 우선, 없으면 product_name 앞 50자)
      */
     public String getKeyword() {
-        if (shortKeyword != null && !shortKeyword.isEmpty()) {
-            return shortKeyword;
+        String keyword = shortKeyword != null ? shortKeyword.trim() : "";
+        if (!keyword.isEmpty()) {
+            return keyword;
         }
-        if (productName.length() > 50) {
-            return productName.substring(0, 50);
+        String product = productName != null ? productName.trim() : "";
+        if (product.isEmpty()) {
+            return nvMid != null ? nvMid : "";
         }
-        return productName;
+        if (product.length() > 50) {
+            return product.substring(0, 50);
+        }
+        return product;
     }
 }
