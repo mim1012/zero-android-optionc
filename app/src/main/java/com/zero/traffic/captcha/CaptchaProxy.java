@@ -17,6 +17,8 @@ import java.io.ByteArrayOutputStream;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import android.os.Build;
+
 /**
  * CAPTCHA 프록시 — 서버 경유 Claude Vision 호출
  *
@@ -179,7 +181,8 @@ public class CaptchaProxy {
 
     private void inputAnswer(WebView webView, String answer) {
         // 입력창 찾기 + 값 입력
-        String js = String.format(
+        String safeAnswer = JSONObject.quote(answer);
+        String js =
             "(function(){" +
             "var sels=['input#rcpt_answer','input[placeholder*=\"정답\"]','input[placeholder*=\"입력\"]'," +
             "'input[name*=\"answer\"]','input[id*=\"answer\"]','.captcha_input input','#captcha_answer'];" +
@@ -187,13 +190,12 @@ public class CaptchaProxy {
             "for(var i=0;i<sels.length;i++){inp=document.querySelector(sels[i]);if(inp)break;}" +
             "if(!inp)return 'no_input';" +
             "inp.click();inp.focus();inp.value='';" +
-            "var text='%s';" +
+            "var text=" + safeAnswer + ";" +
             "for(var j=0;j<text.length;j++){" +
             "  inp.value+=text[j];" +
             "  inp.dispatchEvent(new Event('input',{bubbles:true}));" +
             "}" +
-            "return 'ok';})()",
-            answer.replace("'", "\\'"));
+            "return 'ok';})()";
 
         evalJSSync(webView, js, 5000);
     }
@@ -221,13 +223,23 @@ public class CaptchaProxy {
 
     private String evalJSSync(WebView webView, String js, long timeoutMs) {
         CompletableFuture<String> future = new CompletableFuture<>();
-        mainHandler.post(() -> webView.evaluateJavascript(js, value -> {
-            if (value != null && value.startsWith("\"") && value.endsWith("\"")) {
-                value = value.substring(1, value.length() - 1)
-                    .replace("\\\"", "\"").replace("\\\\", "\\");
+        mainHandler.post(() -> {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && webView.isDestroyed()) {
+                future.complete(null);
+                return;
             }
-            future.complete(value);
-        }));
+            try {
+                webView.evaluateJavascript(js, value -> {
+                    if (value != null && value.startsWith("\"") && value.endsWith("\"")) {
+                        value = value.substring(1, value.length() - 1)
+                            .replace("\\\"", "\"").replace("\\\\", "\\");
+                    }
+                    future.complete(value);
+                });
+            } catch (Exception e) {
+                future.complete(null);
+            }
+        });
         try {
             return future.get(timeoutMs, TimeUnit.MILLISECONDS);
         } catch (Exception e) {

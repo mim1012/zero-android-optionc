@@ -35,6 +35,7 @@ public class VariableResolver {
         vars.put("task.target_index", String.valueOf(task.getTargetIndex()));
         vars.put("task.traffic_id", String.valueOf(task.getTrafficId()));
         vars.put("task.short_keyword", task.getShortKeyword());
+        vars.put("task.target_url", task.getTargetUrl() != null ? task.getTargetUrl() : "");
 
         // 3. 시나리오 변수 중 {{task.*}} 참조를 실제 값으로 치환
         for (Map.Entry<String, String> entry : scenario.getVariables().entrySet()) {

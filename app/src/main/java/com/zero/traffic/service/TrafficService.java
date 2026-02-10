@@ -184,7 +184,7 @@ public class TrafficService extends Service {
                 }
                 settings.setUserAgentString(
                     "Mozilla/5.0 (Linux; Android " + Build.VERSION.RELEASE + "; " + Build.MODEL +
-                    ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+                    ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.163 Mobile Safari/537.36"
                 );
                 webView.setWebViewClient(new WebViewClient());
                 created[0] = true;
@@ -239,7 +239,7 @@ public class TrafficService extends Service {
                 Scenario scenario = scenarioManager.selectScenario();
                 if (scenario == null) {
                     Logger.e("시나리오 없음");
-                    taskManager.fail(task.getTrafficId(), "No scenario available");
+                    taskManager.fail(task.getTrafficId(), task.getSlotId(), "No scenario available");
                     RandomDelay.sleepBetween(30000, 60000);
                     continue;
                 }
@@ -249,9 +249,9 @@ public class TrafficService extends Service {
 
                 // 4. 결과 보고
                 if (result.isSuccess()) {
-                    taskManager.complete(task.getTrafficId());
+                    taskManager.complete(task.getTrafficId(), task.getSlotId());
                 } else {
-                    taskManager.fail(task.getTrafficId(), result.getMessage());
+                    taskManager.fail(task.getTrafficId(), task.getSlotId(), result.getMessage());
                 }
 
                 // 5. 다음 작업 전 대기

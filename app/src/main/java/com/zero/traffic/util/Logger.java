@@ -11,8 +11,8 @@ import java.util.Locale;
  */
 public class Logger {
     private static final String TAG = "ZeroTraffic";
-    private static final SimpleDateFormat TIME_FMT =
-            new SimpleDateFormat("HH:mm:ss", Locale.getDefault());
+    private static final ThreadLocal<SimpleDateFormat> TIME_FMT =
+            ThreadLocal.withInitial(() -> new SimpleDateFormat("HH:mm:ss", Locale.getDefault()));
 
     public static void i(String msg) {
         Log.i(TAG, format(msg));
@@ -39,6 +39,6 @@ public class Logger {
     }
 
     private static String format(String msg) {
-        return "[" + TIME_FMT.format(new Date()) + "] " + msg;
+        return "[" + TIME_FMT.get().format(new Date()) + "] " + msg;
     }
 }

@@ -39,14 +39,15 @@ public class TaskManager {
     /**
      * 작업 완료 보고
      */
-    public void complete(int trafficId) {
+    public void complete(int trafficId, int slotId) {
         try {
             JSONObject body = new JSONObject();
             body.put("traffic_id", trafficId);
+            body.put("slot_id", slotId);
             body.put("device_id", deviceId);
 
             api.postJSON("/traffic/complete", body);
-            Logger.i("작업 완료 보고: #" + trafficId);
+            Logger.i("작업 완료 보고: #" + trafficId + " (slot=" + slotId + ")");
 
         } catch (Exception e) {
             Logger.e("완료 보고 실패: " + e.getMessage());
@@ -56,15 +57,16 @@ public class TaskManager {
     /**
      * 작업 실패 보고
      */
-    public void fail(int trafficId, String errorMessage) {
+    public void fail(int trafficId, int slotId, String errorMessage) {
         try {
             JSONObject body = new JSONObject();
             body.put("traffic_id", trafficId);
+            body.put("slot_id", slotId);
             body.put("device_id", deviceId);
             body.put("error_message", errorMessage);
 
             api.postJSON("/traffic/fail", body);
-            Logger.w("작업 실패 보고: #" + trafficId + " → " + errorMessage);
+            Logger.w("작업 실패 보고: #" + trafficId + " (slot=" + slotId + ") → " + errorMessage);
 
         } catch (Exception e) {
             Logger.e("실패 보고 실패: " + e.getMessage());

@@ -15,6 +15,8 @@ import com.zero.traffic.util.Logger;
  * 워커 스레드에서 호출. WebView 조작은 ActionExecutor가 Handler로 처리.
  */
 public class ScenarioRunner {
+    private static final int MAX_CAPTCHA_RETRIES_PER_STEP = 3;
+
     private final WebView webView;
     private final ActionExecutor executor;
     private final CaptchaProxy captchaProxy;
@@ -44,6 +46,7 @@ public class ScenarioRunner {
 
         // 변수 치환기
         VariableResolver resolver = new VariableResolver(scenario, task);
+        int captchaRetryCount = 0;
 
         for (int i = 0; i < scenario.getSteps().size(); i++) {
             if (cancelled) {
@@ -63,7 +66,12 @@ public class ScenarioRunner {
                     // CAPTCHA 발견 → 서버 프록시로 해결 시도
                     String onCaptcha = step.getString("onCaptcha", "");
                     if ("solveCaptcha".equals(onCaptcha) || step.getAction().equals("checkStatus")) {
-                        Logger.w("CAPTCHA 감지 → 해결 시도");
+                        captchaRetryCount++;
+                        if (captchaRetryCount > MAX_CAPTCHA_RETRIES_PER_STEP) {
+                            Logger.e("CAPTCHA 최대 재시도 초과 (" + MAX_CAPTCHA_RETRIES_PER_STEP + "회) at " + step.getId());
+                            return StepResult.fail("CAPTCHA 재시도 초과 at " + step.getId());
+                        }
+                        Logger.w("CAPTCHA 감지 → 해결 시도 (" + captchaRetryCount + "/" + MAX_CAPTCHA_RETRIES_PER_STEP + ")");
                         boolean solved = captchaProxy.solve(webView);
                         if (!solved) {
                             Logger.e("CAPTCHA 해결 실패");
@@ -82,6 +90,8 @@ public class ScenarioRunner {
                 Logger.e("스텝 실패: " + step.getId() + " → " + result.getMessage());
                 return result;
             }
+            // 스텝 성공 시 CAPTCHA 카운터 리셋
+            captchaRetryCount = 0;
         }
 
         Logger.i("═══ 시나리오 완료: " + scenario.getName() + " ═══");
