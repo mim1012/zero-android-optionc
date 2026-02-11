@@ -410,6 +410,110 @@ public class ActionExecutor {
         return StepResult.success();
     }
 
+    // ── evalJS (인라인 JS + 변수 주입) ───────────────────
+
+    public StepResult evalJS(Step step) {
+        String script = step.getString("script", "");
+        if (script.isEmpty()) return StepResult.fail("evalJS: empty script");
+
+        Logger.step(step.getId(), "evalJS");
+
+        // vars 필드가 있으면 JSON으로 직렬화하여 __V 변수로 주입
+        JSONObject varsObj = step.getRaw().optJSONObject("vars");
+        if (varsObj != null) {
+            // JSONObject.toString()은 올바르게 이스케이프된 JSON 출력
+            script = "var __V=" + varsObj.toString() + ";" + script;
+        }
+
+        String result = evalJSSync(script, step.getLong("timeout", 30000));
+        if (result != null && result.startsWith("ERROR:")) {
+            return StepResult.fail(result);
+        }
+        return StepResult.success();
+    }
+
+    // ── findMid (3전략 MID 탐색 + 스크롤) ───────────────
+
+    public StepResult findMid(Step step) {
+        String mid = step.getString("mid", "");
+        int maxScroll = step.getInt("maxScroll", 10);
+        if (mid.isEmpty()) return StepResult.fail("findMid: mid empty");
+
+        Logger.step(step.getId(), "findMid", "mid=" + mid);
+
+        // 3전략 MID 탐색 JS (unified-runner-shopping-tab-app.ts 동일)
+        String midLiteral = mid.replace("'", "\\'");
+        String findJS =
+            "(function(){var mid='" + midLiteral + "';" +
+            // 전략1: URL 파라미터 nv_mid=
+            "var a1=document.querySelector('a[href*=\"nv_mid='+mid+'\"]');" +
+            "if(a1){a1.scrollIntoView({block:'center',behavior:'smooth'});" +
+            "var r=a1.getBoundingClientRect();var d=window.devicePixelRatio||1;" +
+            "return JSON.stringify({x:(r.x+r.width/2)*d,y:(r.y+r.height/2)*d,s:1});}" +
+            // 전략2: URL 경로 /products/
+            "var a2=document.querySelector('a[href*=\"/products/'+mid+'\"]');" +
+            "if(a2){a2.scrollIntoView({block:'center',behavior:'smooth'});" +
+            "var r2=a2.getBoundingClientRect();var d2=window.devicePixelRatio||1;" +
+            "return JSON.stringify({x:(r2.x+r2.width/2)*d2,y:(r2.y+r2.height/2)*d2,s:2});}" +
+            // 전략3: ID 속성 nstore_productId_
+            "var c=document.querySelector('[id=\"nstore_productId_'+mid+'\"]');" +
+            "if(c){var a3=c.previousElementSibling;" +
+            "while(a3&&a3.tagName!=='A')a3=a3.previousElementSibling;" +
+            "if(!a3)a3=c.closest('a');" +
+            "if(a3){a3.scrollIntoView({block:'center',behavior:'smooth'});" +
+            "var r3=a3.getBoundingClientRect();var d3=window.devicePixelRatio||1;" +
+            "return JSON.stringify({x:(r3.x+r3.width/2)*d3,y:(r3.y+r3.height/2)*d3,s:3});}}" +
+            "return 'not_found';})()";
+
+        for (int i = 0; i < maxScroll; i++) {
+            if (i > 0) {
+                Logger.i("findMid: scroll " + (i + 1) + "/" + maxScroll);
+            }
+
+            // scrollIntoView 후 레이아웃 안정화 대기
+            RandomDelay.sleepBetween(300, 500);
+
+            String result = evalJSSync(findJS, 5000);
+            if (result != null && !result.equals("not_found") && !result.equals("null") && !result.isEmpty()) {
+                try {
+                    JSONObject pos = new JSONObject(result);
+                    float x = (float) pos.getDouble("x");
+                    float y = (float) pos.getDouble("y");
+                    int strategy = pos.optInt("s", 0);
+                    Logger.i("findMid: MID 발견 (전략 " + strategy + ")");
+
+                    RandomDelay.sleepBetween(500, 1000);
+                    simulateTouch(x, y);
+
+                    // 네비게이션 대기
+                    RandomDelay.sleepBetween(2000, 3500);
+                    return StepResult.success();
+
+                } catch (Exception e) {
+                    Logger.w("findMid: parse error: " + e.getMessage());
+                }
+            }
+
+            // 스크롤 다운
+            int scrollPx = RandomDelay.between(400, 600);
+            evalJSSync(String.format("window.scrollBy({top:%d,behavior:'smooth'})", scrollPx), 2000);
+            RandomDelay.sleepBetween(500, 800);
+
+            // 스크롤 끝 감지
+            if (i > 3) {
+                String heightCheck = evalJSSync(
+                    "(function(){var h=document.body.scrollHeight;var y=window.scrollY+window.innerHeight;return (y>=h-50)?'end':'more';})()",
+                    2000);
+                if ("end".equals(heightCheck)) {
+                    Logger.w("findMid: scroll 끝");
+                    break;
+                }
+            }
+        }
+
+        return StepResult.fail("findMid: MID not found after " + maxScroll + " scrolls");
+    }
+
     // ═══════════════════════════════════════════════════
     // 내부 유틸
     // ═══════════════════════════════════════════════════
@@ -471,7 +575,7 @@ public class ActionExecutor {
     }
 
     private boolean isWebViewDestroyed() {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && webView.isDestroyed();
+        return webView == null;
     }
 
     private String jsQuote(String s) {

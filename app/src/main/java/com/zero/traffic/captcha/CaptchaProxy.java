@@ -224,7 +224,7 @@ public class CaptchaProxy {
     private String evalJSSync(WebView webView, String js, long timeoutMs) {
         CompletableFuture<String> future = new CompletableFuture<>();
         mainHandler.post(() -> {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && webView.isDestroyed()) {
+            if (webView == null) {
                 future.complete(null);
                 return;
             }

@@ -47,11 +47,18 @@ public class VariableResolver {
 
     /**
      * Step의 모든 string 값에서 {{변수}}를 치환한 새 Step 반환
+     * 중첩된 JSONObject도 재귀적으로 치환
      */
     public Step resolve(Step step) {
-        JSONObject original = step.getRaw();
-        JSONObject resolved = new JSONObject();
+        JSONObject resolved = resolveObject(step.getRaw());
+        return new Step(resolved);
+    }
 
+    /**
+     * JSONObject의 모든 string 값을 재귀적으로 치환
+     */
+    private JSONObject resolveObject(JSONObject original) {
+        JSONObject resolved = new JSONObject();
         try {
             Iterator<String> keys = original.keys();
             while (keys.hasNext()) {
@@ -59,14 +66,16 @@ public class VariableResolver {
                 Object val = original.opt(key);
                 if (val instanceof String) {
                     resolved.put(key, resolveString((String) val));
+                } else if (val instanceof JSONObject) {
+                    resolved.put(key, resolveObject((JSONObject) val));
                 } else {
                     resolved.put(key, val);
                 }
             }
         } catch (org.json.JSONException e) {
-            return step; // 치환 실패 시 원본 반환
+            return original;
         }
-        return new Step(resolved);
+        return resolved;
     }
 
     /**

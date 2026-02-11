@@ -127,6 +127,10 @@ public class ScenarioRunner {
                 return executor.report(step);
             case "log":
                 return executor.log(step);
+            case "evalJS":
+                return executor.evalJS(step);
+            case "findMid":
+                return executor.findMid(step);
             case "runScript":
                 String name = step.getString("scriptName", "");
                 String content = scriptEngine.getScript(name);
