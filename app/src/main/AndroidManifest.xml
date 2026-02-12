@@ -16,6 +16,10 @@
     <uses-permission android:name="android.permission.WRITE_SETTINGS"
         tools:ignore="ProtectedPermissions" />
 
+    <!-- IP 회전 (비행기모드 토글) — adb shell pm grant 필요 -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS"
+        tools:ignore="ProtectedPermissions" />
+
     <!-- 포그라운드 서비스 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
@@ -25,6 +29,9 @@
 
     <!-- 화면 꺼짐 방지 -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- WebView 오버레이 (화면에 표시) -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
     <application
         android:name=".ZeroTrafficApp"
@@ -60,6 +67,11 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- WebView 토글 리시버 (알림 액션 버튼) -->
+        <receiver
+            android:name=".service.ToggleReceiver"
+            android:exported="false" />
 
         <!-- 자동 설치 AccessibilityService -->
         <service

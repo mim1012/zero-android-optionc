@@ -59,6 +59,12 @@ public class ActionExecutor {
 
             webView.setWebViewClient(new WebViewClient() {
                 @Override
+                public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                    // 모든 URL을 WebView 내부에서 처리 (외부 브라우저 실행 방지)
+                    return false;
+                }
+
+                @Override
                 public void onPageFinished(WebView view, String loadedUrl) {
                     if (!future.isDone()) {
                         future.complete(null);
@@ -283,10 +289,11 @@ public class ActionExecutor {
         String js = "(function(){" +
                 "var t=document.body?document.body.innerText:'';" +
                 "if(t.includes('비정상적인 접근')||t.includes('일시적으로 제한')||(t.includes('접근이 제한')&&t.includes('잠시 후'))) return 'blocked';" +
-                "if(t.includes('보안 확인')||t.includes('자동입력방지')||t.includes('영수증')) return 'captcha';" +
+                "if(t.includes('자동입력방지')||(t.includes('보안 확인')&&t.includes('영수증 번호'))) return 'captcha';" +
                 "return 'ok';})()";
 
         String status = evalJSSync(js, 5000);
+        Logger.i("checkStatus result: " + status);
 
         if ("blocked".equals(status)) {
             String onBlocked = step.getString("onBlocked", "");
@@ -360,6 +367,10 @@ public class ActionExecutor {
 
         int dwellTime = RandomDelay.between(ms[0], ms[1]);
         Logger.step(step.getId(), "dwell", dwellTime + "ms");
+
+        // 디버그: 체류 시작 시 URL 확인
+        String dwellUrl = evalJSSync("(function(){return window.location.href;})()", 3000);
+        Logger.i("dwell URL: " + dwellUrl);
 
         long start = System.currentTimeMillis();
 
@@ -437,25 +448,23 @@ public class ActionExecutor {
     public StepResult findMid(Step step) {
         String mid = step.getString("mid", "");
         int maxScroll = step.getInt("maxScroll", 10);
+        int maxPages = step.getInt("maxPages", 5);
         if (mid.isEmpty()) return StepResult.fail("findMid: mid empty");
 
         Logger.step(step.getId(), "findMid", "mid=" + mid);
 
-        // 3전략 MID 탐색 JS (unified-runner-shopping-tab-app.ts 동일)
+        // 3전략 MID 탐색 JS (unified-runner 동일)
         String midLiteral = mid.replace("'", "\\'");
         String findJS =
             "(function(){var mid='" + midLiteral + "';" +
-            // 전략1: URL 파라미터 nv_mid=
             "var a1=document.querySelector('a[href*=\"nv_mid='+mid+'\"]');" +
             "if(a1){a1.scrollIntoView({block:'center',behavior:'smooth'});" +
             "var r=a1.getBoundingClientRect();var d=window.devicePixelRatio||1;" +
             "return JSON.stringify({x:(r.x+r.width/2)*d,y:(r.y+r.height/2)*d,s:1});}" +
-            // 전략2: URL 경로 /products/
             "var a2=document.querySelector('a[href*=\"/products/'+mid+'\"]');" +
             "if(a2){a2.scrollIntoView({block:'center',behavior:'smooth'});" +
             "var r2=a2.getBoundingClientRect();var d2=window.devicePixelRatio||1;" +
             "return JSON.stringify({x:(r2.x+r2.width/2)*d2,y:(r2.y+r2.height/2)*d2,s:2});}" +
-            // 전략3: ID 속성 nstore_productId_
             "var c=document.querySelector('[id=\"nstore_productId_'+mid+'\"]');" +
             "if(c){var a3=c.previousElementSibling;" +
             "while(a3&&a3.tagName!=='A')a3=a3.previousElementSibling;" +
@@ -465,53 +474,110 @@ public class ActionExecutor {
             "return JSON.stringify({x:(r3.x+r3.width/2)*d3,y:(r3.y+r3.height/2)*d3,s:3});}}" +
             "return 'not_found';})()";
 
-        for (int i = 0; i < maxScroll; i++) {
-            if (i > 0) {
-                Logger.i("findMid: scroll " + (i + 1) + "/" + maxScroll);
+        // "다음 페이지" 버튼 찾기 JS (unified-runner 동일: button > span 텍스트)
+        String nextPageJS =
+            "(function(){" +
+            "var btns=document.querySelectorAll('button');" +
+            "for(var i=0;i<btns.length;i++){" +
+            "  if(btns[i].disabled)continue;" +
+            "  var spans=btns[i].querySelectorAll('span');" +
+            "  for(var j=0;j<spans.length;j++){" +
+            "    if(spans[j].textContent.trim()==='다음 페이지'){" +
+            "      btns[i].scrollIntoView({block:'center',behavior:'smooth'});" +
+            "      var r=btns[i].getBoundingClientRect();" +
+            "      var d=window.devicePixelRatio||1;" +
+            "      return JSON.stringify({x:(r.x+r.width/2)*d,y:(r.y+r.height/2)*d});" +
+            "    }" +
+            "  }" +
+            "}" +
+            "return 'not_found';})()";
+
+        // 페이지 순회 (1페이지 = 현재 + 다음 페이지 버튼으로 2~maxPages)
+        for (int page = 1; page <= maxPages; page++) {
+            if (page > 1) {
+                Logger.i("findMid: " + page + "페이지 탐색");
             }
 
-            // scrollIntoView 후 레이아웃 안정화 대기
-            RandomDelay.sleepBetween(300, 500);
+            // 페이지 상단으로 스크롤 (2페이지부터)
+            if (page > 1) {
+                evalJSSync("window.scrollTo(0,0)", 2000);
+                RandomDelay.sleepBetween(500, 800);
+            }
 
-            String result = evalJSSync(findJS, 5000);
-            if (result != null && !result.equals("not_found") && !result.equals("null") && !result.isEmpty()) {
-                try {
-                    JSONObject pos = new JSONObject(result);
-                    float x = (float) pos.getDouble("x");
-                    float y = (float) pos.getDouble("y");
-                    int strategy = pos.optInt("s", 0);
-                    Logger.i("findMid: MID 발견 (전략 " + strategy + ")");
+            // 현재 페이지에서 스크롤하며 MID 탐색
+            for (int i = 0; i < maxScroll; i++) {
+                if (i > 0) {
+                    Logger.i("findMid: scroll " + (i + 1) + "/" + maxScroll + " (p" + page + ")");
+                }
 
-                    RandomDelay.sleepBetween(500, 1000);
-                    simulateTouch(x, y);
+                RandomDelay.sleepBetween(300, 500);
 
-                    // 네비게이션 대기
-                    RandomDelay.sleepBetween(2000, 3500);
-                    return StepResult.success();
+                String result = evalJSSync(findJS, 5000);
+                if (result != null && !result.equals("not_found") && !result.equals("null") && !result.isEmpty()) {
+                    try {
+                        JSONObject pos = new JSONObject(result);
+                        float x = (float) pos.getDouble("x");
+                        float y = (float) pos.getDouble("y");
+                        int strategy = pos.optInt("s", 0);
+                        Logger.i("findMid: MID 발견 (전략 " + strategy + ", p" + page + ")");
 
-                } catch (Exception e) {
-                    Logger.w("findMid: parse error: " + e.getMessage());
+                        RandomDelay.sleepBetween(500, 1000);
+                        simulateTouch(x, y);
+
+                        // 클릭 후 페이지 전환 대기
+                        RandomDelay.sleepBetween(2000, 3500);
+
+                        // 디버그: 클릭 후 URL 확인
+                        String afterUrl = evalJSSync("(function(){return window.location.href;})()", 3000);
+                        Logger.i("findMid: 클릭 후 URL: " + afterUrl);
+
+                        return StepResult.success();
+
+                    } catch (Exception e) {
+                        Logger.w("findMid: parse error: " + e.getMessage());
+                    }
+                }
+
+                // 스크롤 다운
+                int scrollPx = RandomDelay.between(400, 600);
+                evalJSSync(String.format("window.scrollBy({top:%d,behavior:'smooth'})", scrollPx), 2000);
+                RandomDelay.sleepBetween(500, 800);
+
+                // 스크롤 끝 감지
+                if (i > 3) {
+                    String heightCheck = evalJSSync(
+                        "(function(){var h=document.body.scrollHeight;var y=window.scrollY+window.innerHeight;return (y>=h-50)?'end':'more';})()",
+                        2000);
+                    if ("end".equals(heightCheck)) {
+                        Logger.i("findMid: scroll 끝 (p" + page + ")");
+                        break;
+                    }
                 }
             }
 
-            // 스크롤 다운
-            int scrollPx = RandomDelay.between(400, 600);
-            evalJSSync(String.format("window.scrollBy({top:%d,behavior:'smooth'})", scrollPx), 2000);
-            RandomDelay.sleepBetween(500, 800);
+            // 현재 페이지에서 못 찾음 → "다음 페이지" 버튼 클릭
+            if (page < maxPages) {
+                String nextResult = evalJSSync(nextPageJS, 3000);
+                if (nextResult == null || nextResult.equals("not_found") || nextResult.equals("null")) {
+                    Logger.i("findMid: 페이지네이션 없음 — 탐색 종료");
+                    break;
+                }
 
-            // 스크롤 끝 감지
-            if (i > 3) {
-                String heightCheck = evalJSSync(
-                    "(function(){var h=document.body.scrollHeight;var y=window.scrollY+window.innerHeight;return (y>=h-50)?'end':'more';})()",
-                    2000);
-                if ("end".equals(heightCheck)) {
-                    Logger.w("findMid: scroll 끝");
+                try {
+                    JSONObject btnPos = new JSONObject(nextResult);
+                    float bx = (float) btnPos.getDouble("x");
+                    float by = (float) btnPos.getDouble("y");
+                    Logger.i("findMid: 다음 페이지 버튼 클릭");
+                    simulateTouch(bx, by);
+                    RandomDelay.sleepBetween(1500, 2500);
+                } catch (Exception e) {
+                    Logger.w("findMid: 다음 페이지 버튼 클릭 실패: " + e.getMessage());
                     break;
                 }
             }
         }
 
-        return StepResult.fail("findMid: MID not found after " + maxScroll + " scrolls");
+        return StepResult.fail("findMid: MID not found after " + maxPages + " pages");
     }
 
     // ═══════════════════════════════════════════════════

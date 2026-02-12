@@ -3,15 +3,21 @@ package com.zero.traffic.service;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
+import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.provider.Settings;
+import android.view.Gravity;
+import android.view.WindowManager;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebViewClient;
 
 import com.zero.traffic.captcha.CaptchaProxy;
@@ -45,6 +51,7 @@ public class TrafficService extends Service {
     private static final String CHANNEL_ID = "zero_traffic";
     private static final int NOTIFICATION_ID = 1;
     private static final String EXTRA_SERVER_URL = "server_url";
+    private static final String ACTION_TOGGLE_WEBVIEW = "com.zero.traffic.TOGGLE_WEBVIEW";
 
     private ExecutorService worker;
     private volatile boolean running = false;
@@ -58,15 +65,25 @@ public class TrafficService extends Service {
     private volatile CaptchaProxy captchaProxy;
     private volatile ScenarioRunner runner;
     private volatile GroupManager groupManager;
+    private WindowManager windowManager;
+    private WindowManager.LayoutParams overlayParams;
+    private volatile boolean webViewVisible = false;
 
     private String deviceId;
+    private String lastNotificationText = "대기 중...";
 
     @Override
     public void onCreate() {
         super.onCreate();
         createNotificationChannel();
-        deviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+        try {
+            deviceId = Settings.Secure.getString(getContentResolver(), Settings.Secure.ANDROID_ID);
+        } catch (Exception e) {
+            deviceId = Build.SERIAL != null ? Build.SERIAL : "unknown_" + System.currentTimeMillis();
+            Logger.w("ANDROID_ID 접근 불가, fallback: " + deviceId);
+        }
         worker = Executors.newSingleThreadExecutor();
+        ToggleReceiver.serviceRef = this;
     }
 
     @Override
@@ -163,7 +180,7 @@ public class TrafficService extends Service {
     }
 
     /**
-     * WebView 초기화 (메인 스레드)
+     * WebView 초기화 (메인 스레드) + WindowManager 오버레이 표시
      */
     private boolean initWebView() {
         CountDownLatch latch = new CountDownLatch(1);
@@ -182,11 +199,36 @@ public class TrafficService extends Service {
                     settings.setAllowFileAccessFromFileURLs(false);
                     settings.setAllowUniversalAccessFromFileURLs(false);
                 }
-                settings.setUserAgentString(
-                    "Mozilla/5.0 (Linux; Android " + Build.VERSION.RELEASE + "; " + Build.MODEL +
-                    ") AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.6045.163 Mobile Safari/537.36"
+                // WebView 기본 UA 사용 (실제 WebView 버전과 일치시킴)
+                // 하드코딩 UA는 WebView 버전과 불일치하여 봇 감지됨
+                webView.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                        return false; // 모든 URL을 WebView 내부에서 처리
+                    }
+                });
+
+                // WindowManager 오버레이로 WebView를 화면에 붙이기
+                windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+                int overlayType = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                        ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                        : WindowManager.LayoutParams.TYPE_PHONE;
+
+                // 완전 투명 오버레이 (렌더링 정상, 사용자에게 안 보임)
+                overlayParams = new WindowManager.LayoutParams(
+                        WindowManager.LayoutParams.MATCH_PARENT,
+                        WindowManager.LayoutParams.MATCH_PARENT,
+                        overlayType,
+                        WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                                | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                        PixelFormat.TRANSLUCENT
                 );
-                webView.setWebViewClient(new WebViewClient());
+                overlayParams.gravity = Gravity.TOP | Gravity.START;
+                overlayParams.alpha = 0f;  // 완전 투명
+
+                windowManager.addView(webView, overlayParams);
+                Logger.i("WebView 오버레이 표시 완료");
+
                 created[0] = true;
             } catch (Exception e) {
                 Logger.e("WebView 초기화 실패: " + e.getMessage());
@@ -254,8 +296,16 @@ public class TrafficService extends Service {
                     taskManager.fail(task.getTrafficId(), task.getSlotId(), result.getMessage());
                 }
 
-                // 5. 다음 작업 전 대기
-                RandomDelay.sleepBetween(30000, 60000);
+                // 5. IP 변경 (데이터 끄기/켜기)
+                updateNotification("IP 변경 중...");
+                rotateIP();
+
+                // 6. WebView 초기화 (새 브라우저 세션)
+                updateNotification("브라우저 초기화...");
+                resetWebView();
+
+                // 7. 다음 작업 전 대기
+                RandomDelay.sleepBetween(5000, 10000);
                 updateNotification("대기 중...");
 
             } catch (Exception e) {
@@ -267,6 +317,122 @@ public class TrafficService extends Service {
                 RandomDelay.sleepBetween(30000, 60000);
             }
         }
+    }
+
+    // ── IP 변경 (비행기 모드 토글) ──────────────────────
+
+    private void rotateIP() {
+        // 방법 1: shell 명령어 (가장 확실)
+        try {
+            Logger.i("IP 변경: 모바일 데이터 OFF");
+            Runtime.getRuntime().exec(new String[]{"svc", "data", "disable"}).waitFor();
+            RandomDelay.sleepBetween(3000, 5000);
+
+            Logger.i("IP 변경: 모바일 데이터 ON");
+            Runtime.getRuntime().exec(new String[]{"svc", "data", "enable"}).waitFor();
+
+            // 네트워크 복구 대기
+            RandomDelay.sleepBetween(5000, 8000);
+
+            // 네트워크 연결 확인 (최대 30초)
+            for (int i = 0; i < 15; i++) {
+                try {
+                    java.net.InetAddress addr = java.net.InetAddress.getByName("m.naver.com");
+                    if (addr != null) {
+                        Logger.i("IP 변경 완료 — 네트워크 복구됨");
+                        return;
+                    }
+                } catch (Exception ignored) {}
+                RandomDelay.sleepBetween(2000, 2000);
+            }
+            Logger.w("IP 변경: 네트워크 복구 타임아웃 — 계속 진행");
+
+        } catch (Exception e) {
+            Logger.w("IP 변경 (svc) 실패: " + e.getMessage() + " — 비행기모드로 시도");
+            // 방법 2: 비행기모드 Settings.Global (fallback)
+            rotateIPviaAirplane();
+        }
+    }
+
+    private void rotateIPviaAirplane() {
+        try {
+            Logger.i("IP 변경: 비행기 모드 ON");
+            Settings.Global.putInt(getContentResolver(), Settings.Global.AIRPLANE_MODE_ON, 1);
+            RandomDelay.sleepBetween(3000, 5000);
+
+            Logger.i("IP 변경: 비행기 모드 OFF");
+            Settings.Global.putInt(getContentResolver(), Settings.Global.AIRPLANE_MODE_ON, 0);
+
+            // 네트워크 복구 대기
+            RandomDelay.sleepBetween(5000, 8000);
+
+            for (int i = 0; i < 15; i++) {
+                try {
+                    java.net.InetAddress addr = java.net.InetAddress.getByName("m.naver.com");
+                    if (addr != null) {
+                        Logger.i("IP 변경 완료 — 네트워크 복구됨");
+                        return;
+                    }
+                } catch (Exception ignored) {}
+                RandomDelay.sleepBetween(2000, 2000);
+            }
+            Logger.w("IP 변경: 네트워크 복구 타임아웃 — 계속 진행");
+
+        } catch (SecurityException e) {
+            Logger.w("IP 변경 실패 (권한 없음): " + e.getMessage());
+        } catch (Exception e) {
+            Logger.w("IP 변경 실패: " + e.getMessage());
+        }
+    }
+
+    // ── WebView 초기화 (쿠키/캐시 클리어) ──────────────
+
+    private void resetWebView() {
+        CountDownLatch latch = new CountDownLatch(1);
+        mainHandler.post(() -> {
+            try {
+                if (webView != null) {
+                    webView.stopLoading();
+                    webView.clearCache(true);
+                    webView.clearHistory();
+                    android.webkit.CookieManager.getInstance().removeAllCookies(null);
+                    android.webkit.CookieManager.getInstance().flush();
+                    webView.loadUrl("about:blank");
+                    Logger.i("WebView 초기화 완료 (캐시/쿠키 클리어)");
+                }
+            } catch (Exception e) {
+                Logger.w("WebView 초기화 실패: " + e.getMessage());
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ── WebView 보이기/숨기기 토글 ────────────────────────
+
+    /** ToggleReceiver에서 호출 */
+    public void onToggleWebView() {
+        toggleWebViewVisibility();
+    }
+
+    private void toggleWebViewVisibility() {
+        mainHandler.post(() -> {
+            if (webView == null || windowManager == null || overlayParams == null) return;
+            webViewVisible = !webViewVisible;
+            overlayParams.alpha = webViewVisible ? 1.0f : 0f;
+            try {
+                windowManager.updateViewLayout(webView, overlayParams);
+            } catch (Exception e) {
+                Logger.w("WebView 토글 실패: " + e.getMessage());
+            }
+            Logger.i("WebView " + (webViewVisible ? "보이기" : "숨기기"));
+            updateNotification(lastNotificationText);
+        });
     }
 
     // ── 알림 ───────────────────────────────────────────
@@ -286,15 +452,29 @@ public class TrafficService extends Service {
         } else {
             builder = new Notification.Builder(this);
         }
-        return builder
-                .setContentTitle("Zero Traffic")
+
+        // 보이기/숨기기 토글 액션 버튼
+        Intent toggleIntent = new Intent(ACTION_TOGGLE_WEBVIEW);
+        toggleIntent.setClass(this, ToggleReceiver.class);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            flags |= PendingIntent.FLAG_IMMUTABLE;
+        }
+        PendingIntent togglePending = PendingIntent.getBroadcast(this, 0, toggleIntent, flags);
+        String toggleLabel = webViewVisible ? "\uD83D\uDC41 숨기기" : "\uD83D\uDC41 보이기";
+
+        builder.setContentTitle("Zero Traffic")
                 .setContentText(text)
                 .setSmallIcon(android.R.drawable.ic_dialog_info)
                 .setOngoing(true)
-                .build();
+                .setStyle(new Notification.BigTextStyle().bigText(text + "\n\n[WebView: " + (webViewVisible ? "ON" : "OFF") + "]"))
+                .addAction(android.R.drawable.ic_menu_view, toggleLabel, togglePending);
+
+        return builder.build();
     }
 
     private void updateNotification(String text) {
+        lastNotificationText = text;
         NotificationManager nm = getSystemService(NotificationManager.class);
         if (nm != null) {
             nm.notify(NOTIFICATION_ID, buildNotification(text));
@@ -304,6 +484,7 @@ public class TrafficService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        ToggleReceiver.serviceRef = null;
         if (worker != null) worker.shutdownNow();
         if (runner != null) runner.cancel();
         if (groupManager != null) groupManager.cleanup();
@@ -316,6 +497,10 @@ public class TrafficService extends Service {
                     currentWebView.loadUrl("about:blank");
                     currentWebView.clearHistory();
                     currentWebView.removeAllViews();
+                    // WindowManager에서 제거
+                    if (windowManager != null) {
+                        windowManager.removeView(currentWebView);
+                    }
                     currentWebView.destroy();
                 } catch (Exception e) {
                     Logger.w("WebView 해제 실패: " + e.getMessage());

@@ -2,7 +2,10 @@ package com.zero.traffic;
 
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
@@ -12,6 +15,7 @@ import android.widget.TextView;
 
 import androidx.appcompat.app.AppCompatActivity;
 
+import com.zero.traffic.service.ToggleReceiver;
 import com.zero.traffic.service.TrafficService;
 import com.zero.traffic.util.Logger;
 
@@ -30,6 +34,7 @@ public class MainActivity extends AppCompatActivity {
     private EditText etServerUrl;
     private Button btnStart;
     private Button btnStop;
+    private Button btnToggleWebView;
     private TextView tvStatus;
     private TextView tvLog;
 
@@ -90,6 +95,22 @@ public class MainActivity extends AppCompatActivity {
         btnStop.setLayoutParams(stopParams);
         btnRow.addView(btnStop);
 
+        btnToggleWebView = new Button(this);
+        btnToggleWebView.setText("👁 WebView");
+        btnToggleWebView.setOnClickListener(v -> {
+            if (ToggleReceiver.serviceRef != null) {
+                ToggleReceiver.serviceRef.onToggleWebView();
+                appendLog("WebView 토글");
+            } else {
+                appendLog("서비스 미실행");
+            }
+        });
+        LinearLayout.LayoutParams toggleParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        toggleParams.setMarginStart(dpToPx(8));
+        btnToggleWebView.setLayoutParams(toggleParams);
+        btnRow.addView(btnToggleWebView);
+
         root.addView(btnRow);
 
         // 상태
@@ -132,6 +153,15 @@ public class MainActivity extends AppCompatActivity {
         String url = etServerUrl.getText().toString().trim();
         if (url.isEmpty()) {
             tvStatus.setText("상태: 서버 URL을 입력하세요");
+            return;
+        }
+
+        // 오버레이 권한 확인
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
+            tvStatus.setText("상태: 오버레이 권한 필요 → 설정에서 허용해주세요");
+            Intent overlayIntent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName()));
+            startActivity(overlayIntent);
             return;
         }
 
