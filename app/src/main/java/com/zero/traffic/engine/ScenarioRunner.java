@@ -1,5 +1,9 @@
 package com.zero.traffic.engine;
 
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
+import android.webkit.CookieManager;
 import android.webkit.WebView;
 
 import com.zero.traffic.captcha.CaptchaProxy;
@@ -8,37 +12,77 @@ import com.zero.traffic.model.Step;
 import com.zero.traffic.model.StepResult;
 import com.zero.traffic.model.TaskInfo;
 import com.zero.traffic.util.Logger;
+import com.zero.traffic.util.RandomDelay;
+
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 시나리오 실행기 — JSON DSL 파싱 → Action 순차 실행
  *
  * 워커 스레드에서 호출. WebView 조작은 ActionExecutor가 Handler로 처리.
+ *
+ * ★ BLOCKED(418/429/529) 감지 시 IP 회전 + WebView 초기화 후 시나리오 자동 재시도
  */
 public class ScenarioRunner {
     private static final int MAX_CAPTCHA_RETRIES_PER_STEP = 3;
+    private static final int MAX_BLOCKED_RETRIES = 2;
 
+    private final Context context;
     private final WebView webView;
     private final ActionExecutor executor;
     private final CaptchaProxy captchaProxy;
     private final ScriptEngine scriptEngine;
+    private final Handler mainHandler;
 
     private volatile boolean cancelled = false;
 
-    public ScenarioRunner(WebView webView, CaptchaProxy captchaProxy, ScriptEngine scriptEngine) {
+    public ScenarioRunner(Context context, WebView webView, CaptchaProxy captchaProxy, ScriptEngine scriptEngine) {
+        this.context = context;
         this.webView = webView;
-        this.executor = new ActionExecutor(webView);
+        this.executor = new ActionExecutor(context, webView);
         this.captchaProxy = captchaProxy;
         this.scriptEngine = scriptEngine;
+        this.mainHandler = new Handler(Looper.getMainLooper());
     }
 
     /**
-     * 시나리오 실행
+     * 시나리오 실행 (BLOCKED 시 자동 재시도)
      *
      * @param scenario JSON DSL 시나리오
      * @param task     서버에서 받은 작업 정보
      * @return 최종 결과 (success/fail)
      */
     public StepResult execute(Scenario scenario, TaskInfo task) {
+        for (int attempt = 0; attempt <= MAX_BLOCKED_RETRIES; attempt++) {
+            if (cancelled) return StepResult.abort("Cancelled");
+
+            if (attempt > 0) {
+                Logger.w("═══ BLOCKED 재시도 " + attempt + "/" + MAX_BLOCKED_RETRIES
+                        + " — IP 회전 + WebView 초기화 ═══");
+                rotateIPAndReset();
+            }
+
+            StepResult result = executeSteps(scenario, task);
+
+            if (!result.isBlocked()) {
+                return result; // 성공, 실패, 캡챠, 중단 → 그대로 반환
+            }
+
+            // BLOCKED → 재시도 (마지막이면 반환)
+            if (attempt == MAX_BLOCKED_RETRIES) {
+                Logger.e("BLOCKED 최대 재시도 초과 (" + MAX_BLOCKED_RETRIES + "회)");
+                return StepResult.fail("BLOCKED 재시도 초과 (418/429/529)");
+            }
+        }
+
+        return StepResult.fail("BLOCKED 재시도 루프 종료");
+    }
+
+    /**
+     * 시나리오 스텝 순차 실행
+     */
+    private StepResult executeSteps(Scenario scenario, TaskInfo task) {
         Logger.i("═══ 시나리오 시작: " + scenario.getName() + " ═══");
         Logger.i("  키워드: " + task.getKeyword());
         Logger.i("  MID: " + task.getNvMid());
@@ -82,7 +126,12 @@ public class ScenarioRunner {
                         continue;
                     }
                 }
-                if (result.isBlocked() || result.isAbort()) {
+                if (result.isBlocked()) {
+                    // ★ BLOCKED → execute()의 외부 루프에서 IP 회전 후 재시도
+                    Logger.w("BLOCKED 감지 at " + step.getId() + " → 재시도 요청");
+                    return result;
+                }
+                if (result.isAbort()) {
                     Logger.e("중단: " + result.getMessage());
                     return result;
                 }
@@ -96,6 +145,64 @@ public class ScenarioRunner {
 
         Logger.i("═══ 시나리오 완료: " + scenario.getName() + " ═══");
         return StepResult.success();
+    }
+
+    /**
+     * ★ IP 회전 + WebView 초기화 (BLOCKED 재시도용)
+     * - svc data disable/enable로 IP 변경
+     * - WebView 쿠키/캐시 클리어
+     * - 새로운 세션으로 시작
+     */
+    private void rotateIPAndReset() {
+        try {
+            // 1. IP 회전 (모바일 데이터 OFF/ON)
+            Logger.i("★ BLOCKED 재시도: IP 회전 시작");
+            Runtime.getRuntime().exec(new String[]{"svc", "data", "disable"}).waitFor();
+            Thread.sleep(3000);
+            Runtime.getRuntime().exec(new String[]{"svc", "data", "enable"}).waitFor();
+
+            // 네트워크 복구 대기 (최대 15초)
+            for (int i = 0; i < 15; i++) {
+                Thread.sleep(1000);
+                try {
+                    java.net.InetAddress addr = java.net.InetAddress.getByName("m.naver.com");
+                    if (addr != null) {
+                        Logger.i("★ IP 회전 완료 (" + (i + 1) + "초)");
+                        break;
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            // 2. WebView 쿠키/캐시 클리어 (메인 스레드)
+            CountDownLatch latch = new CountDownLatch(1);
+            mainHandler.post(() -> {
+                try {
+                    if (webView != null) {
+                        webView.stopLoading();
+                        webView.clearCache(true);
+                        webView.clearHistory();
+                        CookieManager.getInstance().removeAllCookies(null);
+                        CookieManager.getInstance().flush();
+                        webView.loadUrl("about:blank");
+                        Logger.i("★ WebView 초기화 완료 (쿠키/캐시 클리어)");
+                    }
+                } catch (Exception e) {
+                    Logger.w("WebView 리셋 실패: " + e.getMessage());
+                } finally {
+                    latch.countDown();
+                }
+            });
+            latch.await(5, TimeUnit.SECONDS);
+
+            // 3. ActionExecutor 상태 초기화 (stale lastHttpStatus 방지)
+            executor.resetState();
+
+            // 4. 안정화 대기 (너무 빠른 재접속 방지)
+            RandomDelay.sleepBetween(3000, 5000);
+
+        } catch (Exception e) {
+            Logger.w("IP 회전/리셋 실패: " + e.getMessage());
+        }
     }
 
     /**
@@ -143,9 +250,10 @@ public class ScenarioRunner {
     }
 
     /**
-     * 실행 취소
+     * 실행 취소 + WebView destroy 마킹
      */
     public void cancel() {
         cancelled = true;
+        executor.markDestroyed();
     }
 }

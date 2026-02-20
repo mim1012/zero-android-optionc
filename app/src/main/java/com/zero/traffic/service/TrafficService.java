@@ -15,10 +15,14 @@ import android.os.Looper;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.WindowManager;
+import android.webkit.CookieManager;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebViewClient;
+
+import androidx.webkit.WebSettingsCompat;
+import androidx.webkit.WebViewFeature;
 
 import com.zero.traffic.captcha.CaptchaProxy;
 import com.zero.traffic.engine.ScenarioManager;
@@ -166,7 +170,7 @@ public class TrafficService extends Service {
         scenarioManager = new ScenarioManager(this, api, deviceId);
         scriptEngine = new ScriptEngine(this, api);
         captchaProxy = new CaptchaProxy(api, deviceId);
-        runner = new ScenarioRunner(webView, captchaProxy, scriptEngine);
+        runner = new ScenarioRunner(this, webView, captchaProxy, scriptEngine);
 
         // 6. 서버 동기화
         scenarioManager.sync();
@@ -179,8 +183,12 @@ public class TrafficService extends Service {
                 scenarioManager.getCount()));
     }
 
+    // ── Stealth JS — StealthConfig에서 공유 참조 (중복 방지) ────
+    private static final String STEALTH_JS = com.zero.traffic.engine.StealthConfig.STEALTH_JS;
+
     /**
      * WebView 초기화 (메인 스레드) + WindowManager 오버레이 표시
+     * ★ Stealth 모드: UA에서 "wv" 제거, X-Requested-With 제거, 봇 감지 JS 주입
      */
     private boolean initWebView() {
         CountDownLatch latch = new CountDownLatch(1);
@@ -195,13 +203,56 @@ public class TrafficService extends Service {
                 settings.setDatabaseEnabled(true);
                 settings.setAllowFileAccess(false);
                 settings.setAllowContentAccess(false);
+                settings.setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
                     settings.setAllowFileAccessFromFileURLs(false);
                     settings.setAllowUniversalAccessFromFileURLs(false);
                 }
-                // WebView 기본 UA 사용 (실제 WebView 버전과 일치시킴)
-                // 하드코딩 UA는 WebView 버전과 불일치하여 봇 감지됨
+
+                // ★ UA에서 WebView 식별자 제거 ("wv" + "Version/4.0 ")
+                // WebView: ...Build/R16NW; wv) ... Version/4.0 Chrome/...
+                // Chrome:  ...Build/R16NW) ... Chrome/...
+                String defaultUA = settings.getUserAgentString();
+                String stealthUA = defaultUA
+                        .replace("; wv)", ")")
+                        .replace("Version/4.0 ", "");
+                settings.setUserAgentString(stealthUA);
+                Logger.i("Stealth UA: " + stealthUA);
+
+                // ★ X-Requested-With 헤더 제거 (앱 패키지명 노출 방지)
+                try {
+                    if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+                        WebSettingsCompat.setRequestedWithHeaderOriginAllowList(
+                                settings, java.util.Collections.emptySet());
+                        Logger.i("★ X-Requested-With 제거 완료");
+                    } else {
+                        Logger.w("X-Requested-With 제거 미지원");
+                    }
+                } catch (Exception e) {
+                    Logger.w("X-Requested-With 제거 실패: " + e.getMessage());
+                }
+
+                // ★ 쿠키 설정 (서드파티 쿠키 허용 — 네이버 로그인/트래킹 필요)
+                CookieManager cookieManager = CookieManager.getInstance();
+                cookieManager.setAcceptCookie(true);
+                cookieManager.setAcceptThirdPartyCookies(webView, true);
+
+                // ★ Stealth WebViewClient — 봇 감지 우회 JS 주입 + HTTP 에러 로깅
                 webView.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                        view.evaluateJavascript(STEALTH_JS, null);
+                    }
+
+                    @Override
+                    public void onReceivedHttpError(WebView view, WebResourceRequest request,
+                            android.webkit.WebResourceResponse errorResponse) {
+                        if (request.isForMainFrame() && errorResponse != null) {
+                            Logger.w("initWebView HTTP " + errorResponse.getStatusCode()
+                                    + ": " + request.getUrl());
+                        }
+                    }
+
                     @Override
                     public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                         return false; // 모든 URL을 WebView 내부에서 처리
@@ -227,7 +278,7 @@ public class TrafficService extends Service {
                 overlayParams.alpha = 0f;  // 완전 투명
 
                 windowManager.addView(webView, overlayParams);
-                Logger.i("WebView 오버레이 표시 완료");
+                Logger.i("WebView 오버레이 표시 완료 (Stealth 모드)");
 
                 created[0] = true;
             } catch (Exception e) {
