@@ -39,6 +39,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="Zero Traffic"
         android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@style/Theme.MaterialComponents.Light.NoActionBar"
         tools:targetApi="34">
 
@@ -59,12 +60,13 @@
             android:foregroundServiceType="dataSync"
             android:exported="false" />
 
-        <!-- 부팅 리시버 -->
+        <!-- 부팅 + ADB 설치 후 자동 실행 리시버 -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
 

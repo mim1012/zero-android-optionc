@@ -47,6 +47,7 @@ public class ChromeManager {
         this.context = context;
         this.api = api;
         this.httpClient = new OkHttpClient.Builder()
+                .proxy(java.net.Proxy.NO_PROXY)
                 .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(300, java.util.concurrent.TimeUnit.SECONDS) // APK 다운로드 시간
                 .build();

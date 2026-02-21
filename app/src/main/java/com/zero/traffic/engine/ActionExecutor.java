@@ -60,8 +60,14 @@ public class ActionExecutor {
     // ★ smartstore/brand 인터셉트 시 저장한 실제 목적지 URL (Chrome 오픈에 사용)
     private volatile String interceptedProductUrl = "";
 
+    // ★ 마지막 Bridge URL (cr*.shopping.naver.com) — Chrome을 bridge 경유로 열기 위해 저장
+    private volatile String interceptedBridgeUrl = "";
+
     // ★ HTTP 상태 코드 추적 (onReceivedHttpError에서 설정)
     private volatile int lastHttpStatus = 200;
+
+    // 이전 네비게이션 URL (Referer + Sec-Fetch-Site 계산용)
+    private volatile String lastNavigatedUrl = "";
 
     // ★ Stealth JS — StealthConfig에서 공유 참조 (중복 방지)
     private static final String STEALTH_JS = StealthConfig.STEALTH_JS;
@@ -81,6 +87,8 @@ public class ActionExecutor {
         chromeFallbackUsed = false;
         currentMid = "";
         interceptedProductUrl = "";
+        interceptedBridgeUrl = "";
+        lastNavigatedUrl = "";
     }
 
     // ── navigate ────────────────────────────────────────
@@ -147,57 +155,17 @@ public class ActionExecutor {
                     }
                 }
 
-                // ★ smartstore/brand → HTTP 요청 자체를 차단 (nfront 429 완전 방지)
-                // shouldOverrideUrlLoading은 서버사이드 302 리다이렉트에 미발동 →
-                // shouldInterceptRequest는 모든 요청(302 포함)에 발동하므로 확실히 차단
-                @Override
-                public android.webkit.WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-                    String url = request.getUrl().toString();
-                    if (request.isForMainFrame() &&
-                        (url.contains("smartstore.naver.com") || url.contains("brand.naver.com"))) {
-                        Logger.i("★ smartstore 요청 차단 (HTTP 전): " + url.substring(0, Math.min(80, url.length())));
-                        chromeFallbackUsed = true;
-                        interceptedProductUrl = url;
-                        return new android.webkit.WebResourceResponse("text/html", "UTF-8",
-                            new java.io.ByteArrayInputStream("".getBytes()));
-                    }
-                    return null;
-                }
-
-                // ★ smartstore/brand → Chrome Custom Tabs 전환 (클라이언트 네비게이션용 백업)
-                // nfront WAF는 WebView HTTP/2 핑거프린트를 감지하여 차단
-                // bridge URL(cr*.shopping.naver.com)은 클릭 추적용 → WebView에서 정상 처리
-                // 최종 목적지(smartstore/brand)에 도달할 때만 Chrome으로 전환
+                // smartstore/brand → WebView 직접 로드 (모든 URL 통과)
                 @Override
                 public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                    return interceptToChrome(request.getUrl().toString());
+                    String url = request.getUrl().toString();
+                    Logger.i("WebView 네비게이션: " + url.substring(0, Math.min(80, url.length())));
+                    return false;
                 }
 
                 @Override
                 public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                    return interceptToChrome(url);
-                }
-
-                private boolean interceptToChrome(String url) {
-                    if (url == null) return false;
-
-                    // Bridge URL (cr*.shopping.naver.com) → WebView에서 정상 처리
-                    // 네이버 클릭 추적이 정상 동작하도록 WebView가 bridge를 따라감
-                    if (url.contains("cr.shopping.naver.com") || url.contains("cr2.shopping.naver.com")
-                            || url.contains("cr3.shopping.naver.com")) {
-                        Logger.i("Bridge 통과 (WebView): " + url.substring(0, Math.min(80, url.length())));
-                        return false; // WebView에서 처리
-                    }
-
-                    // ★ smartstore/brand URL → 플래그만 설정 (Chrome은 IP 회전 후 열기)
-                    // nfront는 IP 평판 기반 차단 → 같은 IP로 Chrome 열면 418 에러
-                    // findMid/dwell에서 IP 회전 후 Chrome으로 상품페이지 열기
-                    if (url.contains("smartstore.naver.com") || url.contains("brand.naver.com")) {
-                        Logger.i("smartstore 감지 → Chrome 전환 예약 (IP 회전 후 열기)");
-                        chromeFallbackUsed = true;
-                        interceptedProductUrl = url;
-                        return true; // WebView 네비게이션 취소
-                    }
+                    Logger.i("WebView 네비게이션(구): " + (url != null ? url.substring(0, Math.min(80, url.length())) : "null"));
                     return false;
                 }
             });
@@ -218,6 +186,7 @@ public class ActionExecutor {
         }
 
         // domcontentloaded 대기
+        lastNavigatedUrl = url;
         RandomDelay.sleepBetween(300, 700);
         return StepResult.success();
     }
@@ -546,10 +515,10 @@ public class ActionExecutor {
         // Chrome Custom Tabs는 bridge URL 리다이렉트(2~3초) + 페이지 로드(1~2초) 필요
         // 최소 8초 대기: 리다이렉트 3초 + 로드 2초 + 실제 체류 3초
         if (chromeFallbackUsed) {
-            int chromeMinDwell = 8000; // Chrome 최소 체류 시간
+            int chromeMinDwell = 20000; // Chrome 최소 체류 시간 (smartstore 로드 보장: 리다이렉트 3s + 로드 5s + 체류 12s)
             int chromeDwell = Math.max(dwellTime, chromeMinDwell);
-            // 약간의 랜덤 추가 (8~12초)
-            chromeDwell = RandomDelay.between(chromeDwell, chromeDwell + 4000);
+            // 약간의 랜덤 추가 (20~25초)
+            chromeDwell = RandomDelay.between(chromeDwell, chromeDwell + 5000);
             Logger.i("dwell: Chrome Custom Tabs에서 체류 (" + chromeDwell + "ms, 원래=" + dwellTime + "ms)");
             RandomDelay.sleep(chromeDwell);
             // HOME 버튼으로 Chrome 닫기
@@ -655,6 +624,18 @@ public class ActionExecutor {
         String diagTitle = evalJSSync("document.title", 3000);
         Logger.i("findMid 시작: url=" + diagUrl + " title=" + diagTitle);
 
+        // ★ 이미 상품 페이지에 있으면 즉시 성공 반환
+        // (캡챠 해결 후 findMid 재시도 시 이미 smartstore 상품 페이지 진입 상태)
+        if (diagUrl != null && (
+                diagUrl.contains("smartstore.naver.com") ||
+                diagUrl.contains("brand.naver.com") ||
+                (diagUrl.contains("msearch.shopping.naver.com") && diagUrl.contains("/products/")) ||
+                (diagUrl.contains("msearch.shopping.naver.com") && diagUrl.contains("/catalog/")))) {
+            Logger.i("findMid: 이미 상품 페이지 진입 → success (url=" +
+                    diagUrl.substring(0, Math.min(80, diagUrl.length())) + ")");
+            return StepResult.success();
+        }
+
         // ★ 일반 네이버 검색 페이지 → 쇼핑 검색으로 이동 (keyword 있을 때)
         // 랜딩 → m.search.naver.com 으로 리다이렉트되면 쇼핑 컴포넌트 없을 수 있음
         if (!keyword.isEmpty() && diagUrl != null && diagUrl.contains("m.search.naver.com")) {
@@ -675,26 +656,8 @@ public class ActionExecutor {
                         if (!shopNav.isDone()) shopNav.complete(null);
                     }
                     @Override
-                    public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
-                        String u = req.getUrl().toString();
-                        if (req.isForMainFrame() &&
-                            (u.contains("smartstore.naver.com") || u.contains("brand.naver.com"))) {
-                            chromeFallbackUsed = true;
-                            interceptedProductUrl = u;
-                            return new WebResourceResponse("text/html", "UTF-8",
-                                new java.io.ByteArrayInputStream("".getBytes()));
-                        }
-                        return null;
-                    }
-                    @Override
                     public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
-                        String u = req.getUrl().toString();
-                        if (u.contains("smartstore.naver.com") || u.contains("brand.naver.com")) {
-                            chromeFallbackUsed = true;
-                            interceptedProductUrl = u;
-                            return true;
-                        }
-                        return false;
+                        return false; // 모든 URL WebView에서 처리
                     }
                 });
                 webView.loadUrl(shoppingSearchUrl);
@@ -894,39 +857,17 @@ public class ActionExecutor {
                         Logger.i("findMid: MID 발견+클릭 (전략 " + strategy + ", p" + page + ", href=" +
                                 href.substring(0, Math.min(80, href.length())) + ")");
 
-                        // ★ shouldInterceptRequest/shouldOverrideUrlLoading에서 smartstore 감지
-                        if (chromeFallbackUsed) {
-                            String targetUrl = !interceptedProductUrl.isEmpty()
-                                ? interceptedProductUrl
-                                : "https://msearch.shopping.naver.com/catalog/" + mid;
-                            Logger.i("findMid: smartstore 감지 → Chrome 직접 열기: " + targetUrl.substring(0, Math.min(80, targetUrl.length())));
-                            openInChrome(targetUrl);
-                            return StepResult.success();
-                        }
-
-                        // Bridge 리다이렉트 대기 (shouldInterceptRequest가 smartstore 감지까지)
+                        // Bridge 리다이렉트 + 페이지 로드 대기 (최대 2.4초)
                         for (int w = 0; w < 8; w++) {
-                            if (chromeFallbackUsed) break;
                             RandomDelay.sleep(300);
-                        }
-
-                        // ★ 리다이렉트 후 smartstore 감지 확인
-                        if (chromeFallbackUsed) {
-                            String targetUrl = !interceptedProductUrl.isEmpty()
-                                ? interceptedProductUrl
-                                : "https://msearch.shopping.naver.com/catalog/" + mid;
-                            Logger.i("findMid: 리다이렉트 후 smartstore 감지 → Chrome: " + targetUrl.substring(0, Math.min(80, targetUrl.length())));
-                            openInChrome(targetUrl);
-                            return StepResult.success();
                         }
 
                         // 페이지 상태 확인
                         String pageState = detectPageState();
-                        Logger.i("findMid: 페이지 상태: " + pageState);
+                        String afterUrl = evalJSSync("(function(){return window.location.href;})()", 3000);
+                        Logger.i("findMid: 페이지 상태=" + pageState + " url=" + afterUrl);
 
                         if ("product".equals(pageState)) {
-                            // ★ Phase 3: DOM 실제 로드 검증 + 실제 URL 획득
-                            String afterUrl = evalJSSync("(function(){return window.location.href;})()", 3000);
                             String domCheck = evalJSSync(
                                 "(function(){" +
                                 "var s='[class*=\"product_title\"],[class*=\"prd_name\"],[class*=\"price_area\"]," +
@@ -934,49 +875,21 @@ public class ActionExecutor {
                                 "[class*=\"prod_name\"],[class*=\"prod_price\"],[id*=\"PRODUCT\"]';" +
                                 "return document.querySelector(s)?'ok':'no_dom';" +
                                 "})()", 3000);
-                            Logger.i("findMid: 상품 페이지 DOM=" + domCheck + " url=" + afterUrl);
-
-                            // ★ 상품 페이지 항상 Chrome으로 열기 (WebView alpha=0 투명 → 사용자에게 보이게)
-                            // afterUrl = WebView가 실제 로드한 URL (smartstore/catalog 등)
-                            // 없으면 mid 기반 catalog URL로 폴백
-                            String chromeUrl = (afterUrl != null && !afterUrl.isEmpty()
-                                    && !afterUrl.equals("null")
-                                    && !afterUrl.startsWith("about:")
-                                    && !afterUrl.contains("search.naver.com"))
-                                ? afterUrl
-                                : "https://msearch.shopping.naver.com/catalog/" + mid;
-                            openInChrome(chromeUrl);
-                            chromeFallbackUsed = true;
+                            Logger.i("findMid: 상품 페이지 DOM=" + domCheck + " (WebView 직접 로드)");
                             return StepResult.success();
                         }
 
                         if (isBlockedState(pageState)) {
-                            Logger.w("findMid: " + pageState + " 감지 → IP 회전 후 Chrome 폴백");
-                            quickRotateIP();
-                            openInChrome("https://msearch.shopping.naver.com/product/" + mid);
-                            chromeFallbackUsed = true;
-                            return StepResult.success();
+                            Logger.w("findMid: " + pageState + " → blocked 반환");
+                            return StepResult.blocked();
                         }
 
                         if ("captcha".equals(pageState)) {
-                            Logger.w("findMid: 캡챠 감지 → IP 회전 후 Chrome 폴백");
-                            quickRotateIP();
-                            openInChrome("https://msearch.shopping.naver.com/product/" + mid);
-                            chromeFallbackUsed = true;
-                            return StepResult.success();
+                            Logger.w("findMid: 캡챠 감지 → captcha 반환");
+                            return StepResult.captcha();
                         }
 
-                        // unknown/search — Chrome으로 상품페이지 보장
-                        String afterUrl = evalJSSync("(function(){return window.location.href;})()", 3000);
                         Logger.i("findMid: 클릭 후 URL: " + afterUrl);
-                        // WebView가 에러 페이지이거나 상품 페이지가 아니면 Chrome 폴백
-                        if (afterUrl != null && (afterUrl.contains("chrome-error")
-                                || afterUrl.contains("about:blank")
-                                || afterUrl.contains("search.naver.com"))) {
-                            Logger.i("findMid: WebView 상품미로드 → Chrome 직접 폴백");
-                            openInChrome("https://msearch.shopping.naver.com/product/" + mid);
-                            chromeFallbackUsed = true;
-                        }
                         return StepResult.success();
 
                     } catch (Exception e) {
@@ -1108,11 +1021,45 @@ public class ActionExecutor {
         }
 
         try {
+            // ★ WebView Naver 세션 쿠키 수집 → Chrome 첫 요청에 전달
+            // nfront는 Naver 세션 쿠키 없으면 smartstore 차단 → Cookie 헤더로 우회
+            String naverCookies = "";
+            try {
+                android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+                String c1 = cm.getCookie("https://naver.com");
+                String c2 = cm.getCookie("https://m.naver.com");
+                String c3 = cm.getCookie("https://shopping.naver.com");
+                String c4 = cm.getCookie("https://msearch.shopping.naver.com");
+                java.util.LinkedHashMap<String, String> cookieMap = new java.util.LinkedHashMap<>();
+                for (String raw : new String[]{c1, c2, c3, c4}) {
+                    if (raw == null || raw.isEmpty()) continue;
+                    for (String pair : raw.split(";")) {
+                        String trimmed = pair.trim();
+                        int eq = trimmed.indexOf('=');
+                        if (eq > 0) cookieMap.putIfAbsent(trimmed.substring(0, eq).trim(), trimmed);
+                    }
+                }
+                naverCookies = String.join("; ", cookieMap.values());
+                Logger.i("Chrome에 Naver 쿠키 전달: " + Math.min(naverCookies.length(), 120) + "자");
+            } catch (Exception ce) {
+                Logger.w("쿠키 수집 실패: " + ce.getMessage());
+            }
+
             // ★ 직접 Chrome Intent (Service에서 Custom Tabs보다 신뢰성 높음)
             // FLAG_ACTIVITY_CLEAR_TOP: 기존 Chrome 창에 새 URL 로드 보장
             Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
             intent.setPackage("com.android.chrome");
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            // NEW_DOCUMENT: 매번 완전히 새 탭 생성 (이전 ERR_TIMED_OUT 캐시 방지)
+            // NO_HISTORY: recents에 남지 않음 → IP 회전 후 에러 페이지 방지
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                    | Intent.FLAG_ACTIVITY_NEW_DOCUMENT
+                    | Intent.FLAG_ACTIVITY_NO_HISTORY);
+            // ★ Naver 세션 쿠키를 EXTRA_HEADERS로 전달 → nfront 인증 통과
+            if (!naverCookies.isEmpty()) {
+                android.os.Bundle headers = new android.os.Bundle();
+                headers.putString("Cookie", naverCookies);
+                intent.putExtra("com.android.browser:headers", headers);
+            }
             context.startActivity(intent);
             Logger.i("Chrome 열림: " + url.substring(0, Math.min(80, url.length())));
         } catch (Exception e) {
@@ -1134,31 +1081,28 @@ public class ActionExecutor {
 
     /**
      * Chrome 열기 전 빠른 IP 회전 — nfront IP 평판 차단 우회
-     * WRITE_SECURE_SETTINGS로 비행기모드 토글 → 새 LTE IP 취득
-     * (svc data는 앱 UID에서 실행 불가 → Settings.Global 방식 사용)
+     * TrafficService.rotateIP()와 동일한 방식: svc data disable/enable
+     * (broadcast 방식은 Android 13에서 Permission Denial → 사용 불가)
      */
     private void quickRotateIP() {
         try {
-            Logger.i("★ Chrome 전 IP 회전 시작 (비행기모드 토글)");
+            Logger.i("★ Chrome 전 IP 회전 시작 (모바일 데이터 토글)");
             android.content.ContentResolver cr = context.getContentResolver();
 
-            // 비행기모드 ON
-            android.provider.Settings.Global.putInt(cr,
-                    android.provider.Settings.Global.AIRPLANE_MODE_ON, 1);
-            Intent airOn = new Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED);
-            airOn.putExtra("state", true);
-            context.sendBroadcast(airOn);
+            // 모바일 데이터 OFF
+            Runtime.getRuntime().exec(new String[]{"svc", "data", "disable"}).waitFor();
             Thread.sleep(3000);
 
-            // 비행기모드 OFF
-            android.provider.Settings.Global.putInt(cr,
-                    android.provider.Settings.Global.AIRPLANE_MODE_ON, 0);
-            Intent airOff = new Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED);
-            airOff.putExtra("state", false);
-            context.sendBroadcast(airOff);
+            // ★ 데이터 ON 직전 captive portal 비활성화
+            // 새 네트워크 연결 시 Android가 즉시 validated 마킹 → Chrome NET_CAPABILITY_VALIDATED 확보
+            android.provider.Settings.Global.putInt(cr, "captive_portal_detection_enabled", 0);
+            android.provider.Settings.Global.putInt(cr, "captive_portal_mode", 0);
 
-            // 네트워크 복구 대기
-            for (int i = 0; i < 10; i++) {
+            // 모바일 데이터 ON
+            Runtime.getRuntime().exec(new String[]{"svc", "data", "enable"}).waitFor();
+
+            // 네트워크 복구 대기 (최대 15초)
+            for (int i = 0; i < 15; i++) {
                 Thread.sleep(1000);
                 try {
                     java.net.InetAddress addr = java.net.InetAddress.getByName("m.naver.com");
@@ -1295,21 +1239,75 @@ public class ActionExecutor {
     /** navigate용 추가 HTTP 헤더 빌드 */
     private java.util.Map<String, String> buildNavHeaders(String url) {
         java.util.Map<String, String> h = new java.util.LinkedHashMap<>();
+
+        // Accept
         h.put("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8");
-        h.put("Accept-Language", mobileHeaders != null ? mobileHeaders.getAcceptLanguage()
+
+        // Accept-Language
+        h.put("Accept-Language", mobileHeaders != null
+                ? mobileHeaders.getAcceptLanguage()
                 : "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
+
+        // Sec-CH-UA (서버 헤더 있으면 동적, 없으면 폴백)
+        if (mobileHeaders != null && mobileHeaders.isValid()) {
+            h.put("Sec-CH-UA", mobileHeaders.getSecChUa());
+            h.put("Sec-CH-UA-Mobile", mobileHeaders.getSecChUaMobile());
+            h.put("Sec-CH-UA-Platform", mobileHeaders.getSecChUaPlatform());
+        } else {
+            h.put("Sec-CH-UA", "\"Not A(Brand\";v=\"99\", \"Google Chrome\";v=\"131\", \"Chromium\";v=\"131\"");
+            h.put("Sec-CH-UA-Mobile", "?1");
+            h.put("Sec-CH-UA-Platform", "\"Android\"");
+        }
+
+        // Sec-Fetch-*
         h.put("Sec-Fetch-Mode", "navigate");
         h.put("Sec-Fetch-Dest", "document");
+        h.put("Sec-Fetch-User", "?1");
         h.put("Upgrade-Insecure-Requests", "1");
-        // Sec-Fetch-Site: 첫 진입은 none (직접 입력), 랜딩→네이버는 cross-site
-        if (url.contains("naver.com")) {
-            h.put("Sec-Fetch-Site", "cross-site");
-            h.put("Sec-Fetch-User", "?1");
-        } else {
-            h.put("Sec-Fetch-Site", "none");
-            h.put("Sec-Fetch-User", "?1");
+
+        // Sec-Fetch-Site: 이전 URL 기반으로 계산
+        h.put("Sec-Fetch-Site", computeSecFetchSite(url, lastNavigatedUrl));
+
+        // Referer: 이전 URL이 있으면 전송
+        if (!lastNavigatedUrl.isEmpty()) {
+            h.put("Referer", lastNavigatedUrl);
         }
+
+        Logger.i("buildNavHeaders: Referer=" + (lastNavigatedUrl.isEmpty() ? "(none)" : lastNavigatedUrl.substring(0, Math.min(60, lastNavigatedUrl.length())))
+                + " Sec-Fetch-Site=" + h.get("Sec-Fetch-Site"));
         return h;
+    }
+
+    /**
+     * Sec-Fetch-Site 계산
+     * none        : 직접 입력 (이전 URL 없음)
+     * same-origin : scheme + host 동일
+     * same-site   : registrable domain 동일
+     * cross-site  : 다른 도메인
+     */
+    private String computeSecFetchSite(String targetUrl, String refererUrl) {
+        if (refererUrl == null || refererUrl.isEmpty()) return "none";
+        try {
+            Uri target = Uri.parse(targetUrl);
+            Uri referer = Uri.parse(refererUrl);
+            String tHost = target.getHost();
+            String rHost = referer.getHost();
+            if (tHost == null || rHost == null) return "none";
+            if (tHost.equals(rHost)) return "same-origin";
+            if (registrableDomain(tHost).equals(registrableDomain(rHost))) return "same-site";
+            return "cross-site";
+        } catch (Exception e) {
+            return "none";
+        }
+    }
+
+    /** 등록 가능 도메인 추출 (마지막 2파트: naver.com, google.com 등) */
+    private String registrableDomain(String host) {
+        String[] parts = host.split("\\.");
+        if (parts.length >= 2) {
+            return parts[parts.length - 2] + "." + parts[parts.length - 1];
+        }
+        return host;
     }
 
     private String jsQuote(String s) {

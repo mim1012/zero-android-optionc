@@ -143,10 +143,20 @@ public class MainActivity extends AppCompatActivity {
         scroll.addView(root);
         setContentView(scroll);
 
-        // 자동 시작 (URL 저장되어 있으면)
-        if (getIntent().getBooleanExtra("auto_start", false)) {
+        // Logger → UI 연결
+        Logger.setUiListener(line -> runOnUiThread(() -> appendLog(line)));
+
+        // 자동 시작 — 저장된 URL이 있으면 버튼 없이 바로 시작
+        String savedUrlForAutoStart = prefs.getString(KEY_SERVER_URL, "");
+        if (!savedUrlForAutoStart.isEmpty() || getIntent().getBooleanExtra("auto_start", false)) {
             startService();
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        Logger.setUiListener(null);
+        super.onDestroy();
     }
 
     private void startService() {

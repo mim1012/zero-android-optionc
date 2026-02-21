@@ -121,24 +121,22 @@ public class ScenarioRunner {
             }
             if (result.isFailed()) {
                 if (result.isCaptcha()) {
-                    // CAPTCHA 발견 → 서버 프록시로 해결 시도
-                    String onCaptcha = step.getString("onCaptcha", "");
-                    if ("solveCaptcha".equals(onCaptcha) || step.getAction().equals("checkStatus")) {
-                        captchaRetryCount++;
-                        if (captchaRetryCount > MAX_CAPTCHA_RETRIES_PER_STEP) {
-                            Logger.e("CAPTCHA 최대 재시도 초과 (" + MAX_CAPTCHA_RETRIES_PER_STEP + "회) at " + step.getId());
-                            return StepResult.fail("CAPTCHA 재시도 초과 at " + step.getId());
-                        }
-                        Logger.w("CAPTCHA 감지 → 해결 시도 (" + captchaRetryCount + "/" + MAX_CAPTCHA_RETRIES_PER_STEP + ")");
-                        boolean solved = captchaProxy.solve(webView);
-                        if (!solved) {
-                            Logger.e("CAPTCHA 해결 실패");
-                            return StepResult.fail("CAPTCHA 해결 실패 at " + step.getId());
-                        }
-                        Logger.i("CAPTCHA 해결 성공");
-                        i--; // 현재 스텝을 다시 실행
-                        continue;
+                    // CAPTCHA 발견 → 스텝 종류 무관하게 항상 자동 해결 시도
+                    captchaRetryCount++;
+                    if (captchaRetryCount > MAX_CAPTCHA_RETRIES_PER_STEP) {
+                        Logger.e("CAPTCHA 최대 재시도 초과 (" + MAX_CAPTCHA_RETRIES_PER_STEP + "회) at " + step.getId());
+                        return StepResult.fail("CAPTCHA 재시도 초과 at " + step.getId());
                     }
+                    Logger.w("CAPTCHA 감지 (action=" + step.getAction() + ") → 해결 시도 ("
+                            + captchaRetryCount + "/" + MAX_CAPTCHA_RETRIES_PER_STEP + ")");
+                    boolean solved = captchaProxy.solve(webView);
+                    if (!solved) {
+                        Logger.e("CAPTCHA 해결 실패");
+                        return StepResult.fail("CAPTCHA 해결 실패 at " + step.getId());
+                    }
+                    Logger.i("CAPTCHA 해결 성공 → 스텝 재시도: " + step.getId());
+                    i--; // 현재 스텝을 다시 실행
+                    continue;
                 }
                 if (result.isBlocked()) {
                     // ★ BLOCKED → execute()의 외부 루프에서 IP 회전 후 재시도
@@ -201,7 +199,7 @@ public class ScenarioRunner {
                 } catch (Exception ignored) {}
             }
 
-            // 2. WebView 쿠키/캐시 클리어 (메인 스레드)
+            // 2. WebView 쿠키/캐시 클리어 — NNB/BUC 보존 (메인 스레드)
             CountDownLatch latch = new CountDownLatch(1);
             mainHandler.post(() -> {
                 try {
@@ -209,10 +207,29 @@ public class ScenarioRunner {
                         webView.stopLoading();
                         webView.clearCache(true);
                         webView.clearHistory();
-                        CookieManager.getInstance().removeAllCookies(null);
-                        CookieManager.getInstance().flush();
+
+                        // ★ NNB/BUC 보존
+                        CookieManager cm = CookieManager.getInstance();
+                        String naverCookies = cm.getCookie("https://naver.com");
+                        String nnb = extractCookieValue(naverCookies, "NNB");
+                        String buc = extractCookieValue(naverCookies, "BUC");
+
+                        cm.removeAllCookies(null);
+                        cm.flush();
+
+                        if (nnb != null) {
+                            cm.setCookie("https://naver.com", "NNB=" + nnb + "; domain=.naver.com; path=/");
+                            cm.setCookie("https://m.naver.com", "NNB=" + nnb + "; domain=.naver.com; path=/");
+                        }
+                        if (buc != null) {
+                            cm.setCookie("https://naver.com", "BUC=" + buc + "; domain=.naver.com; path=/");
+                            cm.setCookie("https://m.naver.com", "BUC=" + buc + "; domain=.naver.com; path=/");
+                        }
+                        if (nnb != null || buc != null) cm.flush();
+
                         webView.loadUrl("about:blank");
-                        Logger.i("★ WebView 초기화 완료 (쿠키/캐시 클리어)");
+                        Logger.i("★ WebView 초기화 완료 (NNB=" + (nnb != null ? "보존" : "없음")
+                                + " BUC=" + (buc != null ? "보존" : "없음") + ")");
                     }
                 } catch (Exception e) {
                     Logger.w("WebView 리셋 실패: " + e.getMessage());
@@ -283,5 +300,17 @@ public class ScenarioRunner {
     public void cancel() {
         cancelled = true;
         executor.markDestroyed();
+    }
+
+    /** 쿠키 문자열에서 특정 쿠키 값 추출 */
+    private static String extractCookieValue(String cookieStr, String name) {
+        if (cookieStr == null || cookieStr.isEmpty()) return null;
+        for (String part : cookieStr.split(";")) {
+            String trimmed = part.trim();
+            if (trimmed.startsWith(name + "=")) {
+                return trimmed.substring(name.length() + 1).trim();
+            }
+        }
+        return null;
     }
 }

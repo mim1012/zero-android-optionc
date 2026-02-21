@@ -163,6 +163,28 @@ public class TrafficService extends Service {
             Logger.w("Chrome 미준비 — 기본 WebView로 진행");
         }
 
+        // ★ Captive portal 검사 URL → 우리 서버로 변경 (204 반환 보장)
+        // 기본 URL(connectivitycheck.gstatic.com)이 한국 통신사에서 차단/지연 → "인터넷 없음" 오판
+        // 우리 서버가 /generate_204 → 204 No Content 반환 → Android가 네트워크 VALIDATED로 마킹
+        try {
+            String captiveUrl = serverUrl + "/zero/api/v1/generate_204";
+            Settings.Global.putString(getContentResolver(), "captive_portal_http_url", captiveUrl);
+            Settings.Global.putString(getContentResolver(), "captive_portal_https_url", captiveUrl);
+            Settings.Global.putInt(getContentResolver(), "captive_portal_detection_enabled", 1); // 검사 활성화 (우리 서버로)
+            Settings.Global.putInt(getContentResolver(), "captive_portal_mode", 0); // 캡티브 포탈 감지 시 무시
+            Logger.i("★ Captive portal URL → " + captiveUrl);
+
+            // 데이터 재연결 — 새 NetworkMonitor가 변경된 URL로 검사 → 204 수신 → VALIDATED
+            Logger.i("★ 데이터 재연결 시작 (captive portal URL 적용)");
+            Runtime.getRuntime().exec(new String[]{"svc", "data", "disable"}).waitFor();
+            Thread.sleep(1500);
+            Runtime.getRuntime().exec(new String[]{"svc", "data", "enable"}).waitFor();
+            Thread.sleep(5000); // captive portal 검사 + 네트워크 안정화 대기
+            Logger.i("★ 데이터 재연결 완료 — 인터넷 연결 상태 갱신됨");
+        } catch (Exception e) {
+            Logger.w("Captive portal 설정/재연결 실패: " + e.getMessage());
+        }
+
         // 4a. 서버에서 동적 모바일 헤더 가져오기 (워커 스레드 — WebView 초기화 전)
         try {
             mobileHeaderConfig = api.fetchMobileHeaders();
@@ -192,6 +214,10 @@ public class TrafficService extends Service {
         // 6. 서버 동기화
         scenarioManager.sync();
         scriptEngine.sync();
+
+        // 7. 초기 워밍업 — 첫 작업 전 NNB/BUC 발급
+        updateNotification("초기 워밍업 중...");
+        warmupWebView();
 
         Logger.i("초기화 완료. 시나리오: " + scenarioManager.getCount() + "개");
         updateNotification(String.format("%s | %s | %d개 시나리오",
@@ -294,20 +320,15 @@ public class TrafficService extends Service {
                     }
                 });
 
-                // ★ WebView 직접 연결 강제 (시스템 프록시 우회 — mitmproxy 잔재 방지)
-                // OkHttp는 Proxy.NO_PROXY로 처리, WebView(Chromium)는 ProxyController로 처리
+                // ★ WebView 프록시 직접 연결 — 시스템 프록시 우회 (보안/추적 방지)
                 if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
-                    try {
-                        ProxyController.getInstance().setProxyOverride(
-                                new ProxyConfig.Builder().addDirect().build(),
-                                Executors.newSingleThreadExecutor(),
-                                () -> Logger.i("★ WebView 프록시: DIRECT (시스템 프록시 우회 완료)")
-                        );
-                    } catch (Exception e) {
-                        Logger.w("WebView 프록시 우회 설정 실패: " + e.getMessage());
-                    }
+                    ProxyController.getInstance().setProxyOverride(
+                            new ProxyConfig.Builder().addDirect().build(),
+                            java.util.concurrent.Executors.newSingleThreadExecutor(),
+                            () -> Logger.i("★ WebView 프록시: 직접 연결 설정 완료"));
+                    Logger.i("★ WebView 프록시: PROXY_OVERRIDE 직접 연결 적용");
                 } else {
-                    Logger.w("WebView PROXY_OVERRIDE 미지원 — 시스템 프록시가 적용될 수 있음");
+                    Logger.w("★ WebView 프록시: PROXY_OVERRIDE 미지원");
                 }
 
                 // WindowManager 오버레이로 WebView를 화면에 붙이기
@@ -355,6 +376,10 @@ public class TrafficService extends Service {
     /**
      * 메인 루프
      */
+    // ★ IP 회전 주기 — N회 작업마다 1회 IP 변경 (캡챠 빈도 최소화)
+    private static final int IP_ROTATE_INTERVAL = 5;
+    private int taskCount = 0;   // 마지막 IP 회전 이후 완료된 작업 수
+
     private void mainLoop() {
         long lastSync = System.currentTimeMillis();
 
@@ -401,17 +426,31 @@ public class TrafficService extends Service {
                     taskManager.fail(task.getTrafficId(), task.getSlotId(), result.getMessage());
                 }
 
-                // 5. IP 변경 — WebView 숨김
+                // 5. WebView blank + 숨김
+                mainHandler.post(() -> { if (webView != null) webView.loadUrl("about:blank"); });
                 setWebViewVisible(false);
-                updateNotification("IP 변경 중...");
-                rotateIP();
 
-                // 6. WebView 초기화 (새 브라우저 세션)
-                updateNotification("브라우저 초기화...");
-                resetWebView();
+                taskCount++;
+                boolean doRotate = (taskCount >= IP_ROTATE_INTERVAL);
 
-                // 7. 다음 작업 전 대기
-                RandomDelay.sleepBetween(5000, 10000);
+                if (doRotate) {
+                    // ★ 5회마다 IP 회전 + 전체 초기화 + 워밍업
+                    Logger.i(String.format("★ IP 회전 (작업 %d회 완료)", taskCount));
+                    taskCount = 0;
+                    updateNotification("IP 변경 중...");
+                    rotateIP();
+                    updateNotification("브라우저 초기화...");
+                    resetWebView();  // NNB/BUC 보존 + 나머지 클리어
+                    updateNotification("워밍업 중...");
+                    warmupWebView();
+                } else {
+                    // ★ 같은 IP 유지 — 캐시만 클리어 (쿠키 전체 보존)
+                    Logger.i(String.format("★ IP 유지 (이번 IP 작업 %d/%d)", taskCount, IP_ROTATE_INTERVAL));
+                    clearCacheOnly();
+                }
+
+                // 6. 다음 작업 전 대기
+                RandomDelay.sleepBetween(3000, 6000);
                 updateNotification("대기 중...");
 
             } catch (Exception e) {
@@ -425,6 +464,118 @@ public class TrafficService extends Service {
         }
     }
 
+    /**
+     * 캐시/히스토리만 클리어 — 쿠키 전체 보존 (같은 IP 연속 작업 시)
+     * NNB/BUC + 세션 쿠키 유지 → nfront 신뢰점수 누적
+     */
+    private void clearCacheOnly() {
+        CountDownLatch latch = new CountDownLatch(1);
+        mainHandler.post(() -> {
+            try {
+                if (webView != null) {
+                    webView.stopLoading();
+                    webView.clearCache(true);
+                    webView.clearHistory();
+                    webView.loadUrl("about:blank");
+                    Logger.i("캐시 클리어 완료 (쿠키 보존)");
+                }
+            } catch (Exception e) {
+                Logger.w("캐시 클리어 실패: " + e.getMessage());
+            } finally {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await(5, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    // ── WebView 워밍업 (NNB/BUC 발급) ──────────────────
+
+    /**
+     * IP 교체 + 쿠키 클리어 후 네이버 메인 방문 → NNB/BUC 쿠키 발급 유도
+     * nfront WAF는 NNB/BUC 없으면 신뢰점수 낮게 평가 → 영수증 캡챠 / 차단 발생
+     * 워밍업으로 자연스러운 신규 방문자 신호 생성
+     */
+    private void warmupWebView() {
+        Logger.i("★ 워밍업 시작: m.naver.com 방문 (NNB/BUC 발급)");
+
+        CountDownLatch latch = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean done =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        mainHandler.post(() -> {
+            try {
+                if (webView == null) { latch.countDown(); return; }
+                webView.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onPageStarted(WebView view, String url, android.graphics.Bitmap fav) {
+                        view.evaluateJavascript(STEALTH_JS, null);
+                    }
+                    @Override
+                    public void onPageFinished(WebView view, String loadedUrl) {
+                        view.evaluateJavascript(STEALTH_JS, null);
+                        if (done.compareAndSet(false, true)) latch.countDown();
+                    }
+                    @Override
+                    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
+                        return false;
+                    }
+                });
+                webView.loadUrl("https://m.naver.com");
+            } catch (Exception e) {
+                Logger.w("워밍업 로드 실패: " + e.getMessage());
+                latch.countDown();
+            }
+        });
+
+        try {
+            if (!latch.await(15, TimeUnit.SECONDS)) {
+                Logger.w("워밍업: 페이지 로드 타임아웃 — 체류만 진행");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return;
+        }
+
+        // ★ nlog.naver.com 트래킹 픽셀 로드 대기 → NNB 발급 (통상 2~3초)
+        RandomDelay.sleepBetween(4000, 6000);
+
+        // 자연스러운 스크롤 (실제 사용자처럼)
+        int scrollCount = RandomDelay.between(2, 4);
+        for (int i = 0; i < scrollCount; i++) {
+            final int px = RandomDelay.between(250, 500);
+            mainHandler.post(() -> {
+                try {
+                    if (webView != null) {
+                        webView.evaluateJavascript(
+                                "window.scrollBy({top:" + px + ",behavior:'smooth'})", null);
+                    }
+                } catch (Exception ignored) {}
+            });
+            RandomDelay.sleepBetween(1200, 2200);
+        }
+
+        // BUC 등 추가 쿠키 발급 대기
+        RandomDelay.sleepBetween(4000, 7000);
+
+        // 쿠키 확인 로그
+        mainHandler.post(() -> {
+            try {
+                android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+                String cookies = cm.getCookie("https://naver.com");
+                boolean hasNnb = cookies != null && cookies.contains("NNB=");
+                boolean hasBuc = cookies != null && cookies.contains("BUC=");
+                Logger.i("★ 워밍업 완료: NNB=" + hasNnb + " BUC=" + hasBuc
+                        + " | 쿠키=" + (cookies != null ? cookies.length() + "자" : "없음"));
+            } catch (Exception ignored) {}
+        });
+
+        RandomDelay.sleepBetween(500, 1000);
+    }
+
     // ── IP 변경 (비행기 모드 토글) ──────────────────────
 
     private void rotateIP() {
@@ -433,6 +584,12 @@ public class TrafficService extends Service {
             Logger.i("IP 변경: 모바일 데이터 OFF");
             Runtime.getRuntime().exec(new String[]{"svc", "data", "disable"}).waitFor();
             RandomDelay.sleepBetween(3000, 5000);
+
+            // ★ 데이터 ON 직전 captive portal 비활성화 — Android가 연결 즉시 검사 시작하므로 선행 필수
+            try {
+                Settings.Global.putInt(getContentResolver(), "captive_portal_detection_enabled", 0);
+                Settings.Global.putInt(getContentResolver(), "captive_portal_mode", 0);
+            } catch (Exception ignored) {}
 
             Logger.i("IP 변경: 모바일 데이터 ON");
             Runtime.getRuntime().exec(new String[]{"svc", "data", "enable"}).waitFor();
@@ -466,6 +623,12 @@ public class TrafficService extends Service {
             Settings.Global.putInt(getContentResolver(), Settings.Global.AIRPLANE_MODE_ON, 1);
             RandomDelay.sleepBetween(3000, 5000);
 
+            // ★ 비행기모드 OFF 직전 captive portal 비활성화
+            try {
+                Settings.Global.putInt(getContentResolver(), "captive_portal_detection_enabled", 0);
+                Settings.Global.putInt(getContentResolver(), "captive_portal_mode", 0);
+            } catch (Exception ignored) {}
+
             Logger.i("IP 변경: 비행기 모드 OFF");
             Settings.Global.putInt(getContentResolver(), Settings.Global.AIRPLANE_MODE_ON, 0);
 
@@ -491,7 +654,7 @@ public class TrafficService extends Service {
         }
     }
 
-    // ── WebView 초기화 (쿠키/캐시 클리어) ──────────────
+    // ── WebView 초기화 (쿠키/캐시 클리어, NNB/BUC 보존) ──
 
     private void resetWebView() {
         CountDownLatch latch = new CountDownLatch(1);
@@ -501,10 +664,30 @@ public class TrafficService extends Service {
                     webView.stopLoading();
                     webView.clearCache(true);
                     webView.clearHistory();
-                    android.webkit.CookieManager.getInstance().removeAllCookies(null);
-                    android.webkit.CookieManager.getInstance().flush();
+
+                    // ★ NNB/BUC 보존 — 클리어 전 저장 (nfront 장기 신뢰 쿠키)
+                    android.webkit.CookieManager cm = android.webkit.CookieManager.getInstance();
+                    String naverCookies = cm.getCookie("https://naver.com");
+                    String nnb = extractCookieValue(naverCookies, "NNB");
+                    String buc = extractCookieValue(naverCookies, "BUC");
+
+                    cm.removeAllCookies(null);
+                    cm.flush();
+
+                    // ★ NNB/BUC 복원 (새 IP에서도 기존 신뢰점수 유지)
+                    if (nnb != null) {
+                        cm.setCookie("https://naver.com", "NNB=" + nnb + "; domain=.naver.com; path=/");
+                        cm.setCookie("https://m.naver.com", "NNB=" + nnb + "; domain=.naver.com; path=/");
+                    }
+                    if (buc != null) {
+                        cm.setCookie("https://naver.com", "BUC=" + buc + "; domain=.naver.com; path=/");
+                        cm.setCookie("https://m.naver.com", "BUC=" + buc + "; domain=.naver.com; path=/");
+                    }
+                    if (nnb != null || buc != null) cm.flush();
+
                     webView.loadUrl("about:blank");
-                    Logger.i("WebView 초기화 완료 (캐시/쿠키 클리어)");
+                    Logger.i("WebView 초기화 완료 (NNB=" + (nnb != null ? "보존" : "없음")
+                            + " BUC=" + (buc != null ? "보존" : "없음") + ")");
                 }
             } catch (Exception e) {
                 Logger.w("WebView 초기화 실패: " + e.getMessage());
@@ -517,6 +700,18 @@ public class TrafficService extends Service {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /** 쿠키 문자열에서 특정 쿠키 값 추출 ("NNB=abc; BUC=xyz" → "abc") */
+    private static String extractCookieValue(String cookieStr, String name) {
+        if (cookieStr == null || cookieStr.isEmpty()) return null;
+        for (String part : cookieStr.split(";")) {
+            String trimmed = part.trim();
+            if (trimmed.startsWith(name + "=")) {
+                return trimmed.substring(name.length() + 1).trim();
+            }
+        }
+        return null;
     }
 
     // ── WebView 보이기/숨기기 ────────────────────────────

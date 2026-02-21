@@ -30,7 +30,7 @@ public class ApiClient {
                 : serverUrl;
 
         this.http = new OkHttpClient.Builder()
-                .proxy(java.net.Proxy.NO_PROXY)   // 시스템 프록시 우회 (mitmproxy 잔재 방지)
+                .proxy(java.net.Proxy.NO_PROXY)
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(30, TimeUnit.SECONDS)
                 .writeTimeout(15, TimeUnit.SECONDS)

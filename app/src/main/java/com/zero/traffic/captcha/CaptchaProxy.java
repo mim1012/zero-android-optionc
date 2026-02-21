@@ -256,11 +256,32 @@ public class CaptchaProxy {
         "return 'ok';})()";
 
     private static final String EXTRACT_QUESTION_JS =
-        "(function(){var t=document.body?document.body.innerText:'';" +
-        "var m1=t.match(/.+무엇입니까\\??/);if(m1)return m1[0].trim();" +
-        "var m2=t.match(/영수증의\\s+.+?\\s+\\[?\\?\\]?\\s*입니다/);if(m2)return m2[0].trim();" +
-        "var ps=[/가게\\s*위치는\\s*.+?\\s*\\[?\\?\\]?\\s*입니다/,/전화번호는?\\s*.+?\\s*\\[?\\?\\]?\\s*입니다/," +
-        "/.+번째\\s*숫자는\\s*무엇입니까/,/.+번째\\s*글자는\\s*무엇입니까/];" +
-        "for(var i=0;i<ps.length;i++){var m=t.match(ps[i]);if(m)return m[0].trim();}" +
-        "return '';})()";
+        "(function(){" +
+        // 1순위: 질문 전용 DOM 요소
+        "var qEls=['#question','#captcha_question','.captcha_question','.question_area'," +
+        "         '[class*=\"question\"]','[id*=\"question\"]','.rcpt_question'];" +
+        "for(var i=0;i<qEls.length;i++){" +
+        "  var el=document.querySelector(qEls[i]);" +
+        "  if(el&&el.innerText.trim().length>3)return el.innerText.trim();}" +
+        // 2순위: 본문 텍스트 패턴 매칭
+        "var t=document.body?document.body.innerText:'';" +
+        "var patterns=[" +
+        "  /.{2,30}\\s*무엇입니까\\??/," +           // ~무엇입니까?
+        "  /영수증의\\s*.{2,30}\\s*무엇입니까\\??/," + // 영수증의 ~ 무엇입니까
+        "  /영수증의\\s*.{2,30}\\s*입력/," +          // 영수증의 ~ 입력
+        "  /\\d+번째\\s*줄.{0,20}\\s*\\??/," +        // N번째 줄
+        "  /\\d+번째\\s*숫자.{0,10}/," +              // N번째 숫자
+        "  /\\d+번째\\s*글자.{0,10}/," +              // N번째 글자
+        "  /가게\\s*이름.{0,20}/," +                  // 가게 이름
+        "  /가게\\s*위치.{0,20}/," +                  // 가게 위치
+        "  /전화번호.{0,20}/," +                      // 전화번호
+        "  /합계\\s*금액.{0,20}/," +                  // 합계 금액
+        "  /결제\\s*금액.{0,20}/" +                   // 결제 금액
+        "];" +
+        "for(var j=0;j<patterns.length;j++){" +
+        "  var m=t.match(patterns[j]);" +
+        "  if(m&&m[0].length>3)return m[0].trim();}" +
+        // 3순위: 페이지 전체 텍스트 300자 (Claude가 직접 파악)
+        "return t.substring(0,300).trim();" +
+        "})()";
 }
