@@ -30,6 +30,7 @@ public class ApiClient {
                 : serverUrl;
 
         this.http = new OkHttpClient.Builder()
+                .proxy(java.net.Proxy.NO_PROXY)   // 시스템 프록시 우회 (mitmproxy 잔재 방지)
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(30, TimeUnit.SECONDS)
                 .writeTimeout(15, TimeUnit.SECONDS)
@@ -83,6 +84,12 @@ public class ApiClient {
         } catch (Exception e) {
             throw new IOException("POST " + path + " failed: " + e.getMessage(), e);
         }
+    }
+
+    /** GET /headers/mobile — 랜덤 모바일 헤더 가져오기 */
+    public com.zero.traffic.model.MobileHeaderConfig fetchMobileHeaders() throws IOException {
+        JSONObject json = getJSON("/headers/mobile");
+        return new com.zero.traffic.model.MobileHeaderConfig(json);
     }
 
     public String getBaseUrl() {

@@ -46,6 +46,16 @@ public class ScenarioRunner {
         this.mainHandler = new Handler(Looper.getMainLooper());
     }
 
+    /** Chrome 열릴 때 WebView 오버레이 숨기기 콜백 등록 */
+    public void setWebViewHideCallback(Runnable callback) {
+        executor.setOnChromeOpenCallback(callback);
+    }
+
+    /** 서버에서 가져온 모바일 헤더 설정 → ActionExecutor에 전달 */
+    public void setMobileHeaders(com.zero.traffic.model.MobileHeaderConfig headers) {
+        executor.setMobileHeaders(headers);
+    }
+
     /**
      * 시나리오 실행 (BLOCKED 시 자동 재시도)
      *
@@ -105,6 +115,10 @@ public class ScenarioRunner {
             StepResult result = executeStep(step);
 
             // 결과 처리
+            if (result.isSkip()) {
+                Logger.i("스킵: " + step.getId() + " → " + result.getMessage() + " → 다음 작업으로");
+                return result;
+            }
             if (result.isFailed()) {
                 if (result.isCaptcha()) {
                     // CAPTCHA 발견 → 서버 프록시로 해결 시도
@@ -155,11 +169,25 @@ public class ScenarioRunner {
      */
     private void rotateIPAndReset() {
         try {
-            // 1. IP 회전 (모바일 데이터 OFF/ON)
-            Logger.i("★ BLOCKED 재시도: IP 회전 시작");
-            Runtime.getRuntime().exec(new String[]{"svc", "data", "disable"}).waitFor();
-            Thread.sleep(3000);
-            Runtime.getRuntime().exec(new String[]{"svc", "data", "enable"}).waitFor();
+            // 1. IP 회전 — 비행기모드 토글 (WRITE_SECURE_SETTINGS 필요)
+            // svc data는 앱 UID에서 실행 불가 → Settings.Global 방식 사용
+            Logger.i("★ BLOCKED 재시도: IP 회전 시작 (비행기모드 토글)");
+            android.content.ContentResolver cr = context.getContentResolver();
+
+            android.provider.Settings.Global.putInt(cr,
+                    android.provider.Settings.Global.AIRPLANE_MODE_ON, 1);
+            android.content.Intent airOn = new android.content.Intent(
+                    android.content.Intent.ACTION_AIRPLANE_MODE_CHANGED);
+            airOn.putExtra("state", true);
+            context.sendBroadcast(airOn);
+            Thread.sleep(4000);
+
+            android.provider.Settings.Global.putInt(cr,
+                    android.provider.Settings.Global.AIRPLANE_MODE_ON, 0);
+            android.content.Intent airOff = new android.content.Intent(
+                    android.content.Intent.ACTION_AIRPLANE_MODE_CHANGED);
+            airOff.putExtra("state", false);
+            context.sendBroadcast(airOff);
 
             // 네트워크 복구 대기 (최대 15초)
             for (int i = 0; i < 15; i++) {

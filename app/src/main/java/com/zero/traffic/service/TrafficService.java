@@ -21,6 +21,8 @@ import android.webkit.WebView;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebViewClient;
 
+import androidx.webkit.ProxyConfig;
+import androidx.webkit.ProxyController;
 import androidx.webkit.WebSettingsCompat;
 import androidx.webkit.WebViewFeature;
 
@@ -75,6 +77,7 @@ public class TrafficService extends Service {
 
     private String deviceId;
     private String lastNotificationText = "대기 중...";
+    private volatile com.zero.traffic.model.MobileHeaderConfig mobileHeaderConfig;
 
     @Override
     public void onCreate() {
@@ -160,7 +163,17 @@ public class TrafficService extends Service {
             Logger.w("Chrome 미준비 — 기본 WebView로 진행");
         }
 
-        // 4. WebView 초기화 (메인 스레드에서)
+        // 4a. 서버에서 동적 모바일 헤더 가져오기 (워커 스레드 — WebView 초기화 전)
+        try {
+            mobileHeaderConfig = api.fetchMobileHeaders();
+            Logger.i("★ 서버 헤더 수신: UA=" + mobileHeaderConfig.getUserAgent().substring(
+                    0, Math.min(80, mobileHeaderConfig.getUserAgent().length())));
+        } catch (Exception e) {
+            Logger.w("서버 헤더 실패 → 기본 UA 사용: " + e.getMessage());
+            mobileHeaderConfig = null;
+        }
+
+        // 4b. WebView 초기화 (메인 스레드에서)
         if (!initWebView()) {
             throw new IllegalStateException("WebView 초기화 실패");
         }
@@ -171,6 +184,10 @@ public class TrafficService extends Service {
         scriptEngine = new ScriptEngine(this, api);
         captchaProxy = new CaptchaProxy(api, deviceId);
         runner = new ScenarioRunner(this, webView, captchaProxy, scriptEngine);
+        runner.setWebViewHideCallback(() -> setWebViewVisible(false));
+        if (mobileHeaderConfig != null) {
+            runner.setMobileHeaders(mobileHeaderConfig);
+        }
 
         // 6. 서버 동기화
         scenarioManager.sync();
@@ -209,15 +226,33 @@ public class TrafficService extends Service {
                     settings.setAllowUniversalAccessFromFileURLs(false);
                 }
 
-                // ★ UA에서 WebView 식별자 제거 ("wv" + "Version/4.0 ")
-                // WebView: ...Build/R16NW; wv) ... Version/4.0 Chrome/...
-                // Chrome:  ...Build/R16NW) ... Chrome/...
-                String defaultUA = settings.getUserAgentString();
-                String stealthUA = defaultUA
-                        .replace("; wv)", ")")
-                        .replace("Version/4.0 ", "");
-                settings.setUserAgentString(stealthUA);
-                Logger.i("Stealth UA: " + stealthUA);
+                // ★ UA 설정: 서버 헤더가 있으면 동적 UA, 없으면 기본 스텔스 UA
+                String appliedUA;
+                if (mobileHeaderConfig != null && mobileHeaderConfig.isValid()) {
+                    appliedUA = mobileHeaderConfig.getUserAgent();
+                } else {
+                    // 폴백: 기존 방식 (wv 제거 + 버전 보장)
+                    String defaultUA = settings.getUserAgentString();
+                    appliedUA = defaultUA
+                            .replace("; wv)", ")")
+                            .replace("Version/4.0 ", "");
+                    try {
+                        java.util.regex.Matcher m = java.util.regex.Pattern
+                                .compile("Chrome/(\\d+)\\.").matcher(appliedUA);
+                        if (m.find()) {
+                            int ver = Integer.parseInt(m.group(1));
+                            if (ver < 131) {
+                                appliedUA = appliedUA.replaceFirst(
+                                        "Chrome/\\d+\\.[\\d.]+", "Chrome/131.0.6778.200");
+                                Logger.i("UA Chrome 버전 업데이트: " + ver + " → 131");
+                            }
+                        }
+                    } catch (Exception e) {
+                        Logger.w("UA 버전 파싱 실패: " + e.getMessage());
+                    }
+                }
+                settings.setUserAgentString(appliedUA);
+                Logger.i("Stealth UA: " + appliedUA);
 
                 // ★ X-Requested-With 헤더 제거 (앱 패키지명 노출 방지)
                 try {
@@ -258,6 +293,22 @@ public class TrafficService extends Service {
                         return false; // 모든 URL을 WebView 내부에서 처리
                     }
                 });
+
+                // ★ WebView 직접 연결 강제 (시스템 프록시 우회 — mitmproxy 잔재 방지)
+                // OkHttp는 Proxy.NO_PROXY로 처리, WebView(Chromium)는 ProxyController로 처리
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) {
+                    try {
+                        ProxyController.getInstance().setProxyOverride(
+                                new ProxyConfig.Builder().addDirect().build(),
+                                Executors.newSingleThreadExecutor(),
+                                () -> Logger.i("★ WebView 프록시: DIRECT (시스템 프록시 우회 완료)")
+                        );
+                    } catch (Exception e) {
+                        Logger.w("WebView 프록시 우회 설정 실패: " + e.getMessage());
+                    }
+                } else {
+                    Logger.w("WebView PROXY_OVERRIDE 미지원 — 시스템 프록시가 적용될 수 있음");
+                }
 
                 // WindowManager 오버레이로 WebView를 화면에 붙이기
                 windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
@@ -337,17 +388,21 @@ public class TrafficService extends Service {
                     continue;
                 }
 
-                // 3. 실행
+                // 3. 실행 — WebView 화면 표시
+                setWebViewVisible(true);
                 StepResult result = runner.execute(scenario, task);
 
                 // 4. 결과 보고
                 if (result.isSuccess()) {
                     taskManager.complete(task.getTrafficId(), task.getSlotId());
+                } else if (result.isSkip()) {
+                    Logger.i("작업 스킵 (slot 페널티 없음): #" + task.getTrafficId() + " → " + result.getMessage());
                 } else {
                     taskManager.fail(task.getTrafficId(), task.getSlotId(), result.getMessage());
                 }
 
-                // 5. IP 변경 (데이터 끄기/켜기)
+                // 5. IP 변경 — WebView 숨김
+                setWebViewVisible(false);
                 updateNotification("IP 변경 중...");
                 rotateIP();
 
@@ -464,14 +519,24 @@ public class TrafficService extends Service {
         }
     }
 
-    // ── WebView 보이기/숨기기 토글 ────────────────────────
+    // ── WebView 보이기/숨기기 ────────────────────────────
 
-    /** ToggleReceiver에서 호출 */
-    public void onToggleWebView() {
-        toggleWebViewVisibility();
+    /** mainLoop에서 호출 — 실행 중 보이기, 대기/IP변경 중 숨기기 */
+    private void setWebViewVisible(boolean visible) {
+        mainHandler.post(() -> {
+            if (webView == null || windowManager == null || overlayParams == null) return;
+            webViewVisible = visible;
+            overlayParams.alpha = visible ? 1.0f : 0f;
+            try {
+                windowManager.updateViewLayout(webView, overlayParams);
+            } catch (Exception e) {
+                Logger.w("WebView 표시 변경 실패: " + e.getMessage());
+            }
+        });
     }
 
-    private void toggleWebViewVisibility() {
+    /** ToggleReceiver에서 호출 (알림 버튼 토글) */
+    public void onToggleWebView() {
         mainHandler.post(() -> {
             if (webView == null || windowManager == null || overlayParams == null) return;
             webViewVisible = !webViewVisible;

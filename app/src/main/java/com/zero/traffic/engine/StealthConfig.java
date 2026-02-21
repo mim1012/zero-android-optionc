@@ -24,46 +24,53 @@ public final class StealthConfig {
      * 9. 네트워크 연결 정보 (4G)
      * 10. Automation 흔적 제거 (Selenium/Puppeteer/Phantom)
      */
+    /** MobileHeaderConfig 기반 동적 Stealth JS 생성 */
+    public static String buildStealthJS(String chromeVersion, String chromeFullVersion, String deviceModel) {
+        return
+            "(function(){" +
+            "try{Object.defineProperty(Navigator.prototype,'webdriver',{get:function(){return false},configurable:true});}catch(e){}" +
+            "try{Object.defineProperty(Navigator.prototype,'languages',{get:function(){return['ko-KR','ko','en-US','en']},configurable:true});}catch(e){}" +
+            "if(!window.chrome)window.chrome={runtime:{},loadTimes:function(){},csi:function(){}};" +
+            "if(window.chrome&&!window.chrome.app)window.chrome.app={isInstalled:false,getDetails:function(){},getIsInstalled:function(){},installState:function(){}};" +
+            "var op=window.navigator.permissions;if(op&&op.query){var oq=op.query.bind(op);" +
+            "op.query=function(p){return p.name==='notifications'?" +
+            "Promise.resolve({state:Notification.permission}):oq(p);}}" +
+            "try{Object.defineProperty(navigator,'userAgentData',{get:function(){return{" +
+            "brands:[{brand:'Not A(Brand',version:'99'},{brand:'Google Chrome',version:'" + chromeVersion + "'},{brand:'Chromium',version:'" + chromeVersion + "'}]," +
+            "mobile:true,platform:'Android'," +
+            "getHighEntropyValues:function(h){return Promise.resolve({" +
+            "brands:[{brand:'Not A(Brand',version:'99.0.0.0'},{brand:'Google Chrome',version:'" + chromeFullVersion + "'},{brand:'Chromium',version:'" + chromeFullVersion + "'}]," +
+            "mobile:true,platform:'Android',platformVersion:'14.0'," +
+            "architecture:'',bitness:'64',model:'" + deviceModel + "',uaFullVersion:'" + chromeFullVersion + "'," +
+            "fullVersionList:[{brand:'Not A(Brand',version:'99.0.0.0'},{brand:'Google Chrome',version:'" + chromeFullVersion + "'},{brand:'Chromium',version:'" + chromeFullVersion + "'}]" +
+            "});}" +
+            "},configurable:true});}catch(e){}" +
+            "})();";
+    }
+
     public static final String STEALTH_JS =
         "(function(){" +
-        // 1. ★ webdriver — Navigator.prototype에서 오버라이드 (configurable:true 필수)
-        // 인스턴스(navigator)에서는 non-configurable이라 실패 → prototype으로 우회
+        // 1. webdriver — WebView는 기본 true 노출 → false로 덮어씌우기
         "try{Object.defineProperty(Navigator.prototype,'webdriver',{get:function(){return false},configurable:true});}catch(e){}" +
-        // 2. plugins/languages — 동일하게 prototype 방식 + try-catch
-        "try{Object.defineProperty(Navigator.prototype,'plugins',{get:function(){return[1,2,3,4,5]},configurable:true});}catch(e){}" +
+        // 2. languages — 한국어 고정
         "try{Object.defineProperty(Navigator.prototype,'languages',{get:function(){return['ko-KR','ko','en-US','en']},configurable:true});}catch(e){}" +
-        // 3. chrome 객체
+        // 3. chrome 객체 — WebView에 없음, nfront가 존재 여부 체크
         "if(!window.chrome)window.chrome={runtime:{},loadTimes:function(){},csi:function(){}};" +
         "if(window.chrome&&!window.chrome.app)window.chrome.app={isInstalled:false,getDetails:function(){},getIsInstalled:function(){},installState:function(){}};" +
         // 4. permissions query 우회
         "var op=window.navigator.permissions;if(op&&op.query){var oq=op.query.bind(op);" +
         "op.query=function(p){return p.name==='notifications'?" +
         "Promise.resolve({state:Notification.permission}):oq(p);}}" +
-        // 5. ★ Canvas fingerprint noise
-        "var _toBlob=HTMLCanvasElement.prototype.toBlob;" +
-        "var _toDataURL=HTMLCanvasElement.prototype.toDataURL;" +
-        "HTMLCanvasElement.prototype.toBlob=function(){" +
-        "var c=this.getContext('2d');if(c){var s=c.fillStyle;" +
-        "c.fillStyle='rgba('+(Math.random()*10|0)+','+(Math.random()*10|0)+','+(Math.random()*10|0)+',0.01)';" +
-        "c.fillRect(0,0,1,1);c.fillStyle=s;}return _toBlob.apply(this,arguments);};" +
-        "HTMLCanvasElement.prototype.toDataURL=function(){" +
-        "var c=this.getContext('2d');if(c){var s=c.fillStyle;" +
-        "c.fillStyle='rgba('+(Math.random()*10|0)+','+(Math.random()*10|0)+','+(Math.random()*10|0)+',0.01)';" +
-        "c.fillRect(0,0,1,1);c.fillStyle=s;}return _toDataURL.apply(this,arguments);};" +
-        // 6. ★ WebGL vendor/renderer (S7 Adreno 530)
-        "try{var _gp=WebGLRenderingContext.prototype.getParameter;" +
-        "WebGLRenderingContext.prototype.getParameter=function(p){" +
-        "if(p===37445)return 'Google Inc. (Qualcomm)';" +
-        "if(p===37446)return 'ANGLE (Qualcomm, Adreno (TM) 530, OpenGL ES 3.2)';" +
-        "return _gp.call(this,p);};}catch(e){}" +
-        // 7. 하드웨어 정보
-        "try{Object.defineProperty(Navigator.prototype,'hardwareConcurrency',{get:function(){return 4},configurable:true});}catch(e){}" +
-        "try{Object.defineProperty(Navigator.prototype,'deviceMemory',{get:function(){return 4},configurable:true});}catch(e){}" +
-        // 8. 네트워크 연결
-        "try{if(navigator.connection)Object.defineProperty(navigator.connection,'effectiveType',{get:function(){return'4g'},configurable:true});}catch(e){}" +
-        // 9. Automation 흔적 제거
-        "delete window.__nightmare;delete window._phantom;delete window.callPhantom;" +
-        "delete window._selenium;delete window.__driver_evaluate;delete window.__webdriver_evaluate;" +
-        "delete window.__fxdriver_evaluate;delete window.__driver_unwrapped;" +
+        // 5. userAgentData (Client Hints) — WebView 미지원, nfront Sec-CH-UA 검증용
+        "try{Object.defineProperty(navigator,'userAgentData',{get:function(){return{" +
+        "brands:[{brand:'Not A(Brand',version:'99'},{brand:'Google Chrome',version:'131'},{brand:'Chromium',version:'131'}]," +
+        "mobile:true,platform:'Android'," +
+        "getHighEntropyValues:function(h){return Promise.resolve({" +
+        "brands:[{brand:'Not A(Brand',version:'99.0.0.0'},{brand:'Google Chrome',version:'131.0.6778.200'},{brand:'Chromium',version:'131.0.6778.200'}]," +
+        "mobile:true,platform:'Android',platformVersion:'14.0'," +
+        "architecture:'',bitness:'64',model:'SM-G977N',uaFullVersion:'131.0.6778.200'," +
+        "fullVersionList:[{brand:'Not A(Brand',version:'99.0.0.0'},{brand:'Google Chrome',version:'131.0.6778.200'},{brand:'Chromium',version:'131.0.6778.200'}]" +
+        "});}" +
+        "},configurable:true});}catch(e){}" +
         "})();";
 }

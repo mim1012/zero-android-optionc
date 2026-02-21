@@ -10,7 +10,8 @@ public class StepResult {
         FAILED,
         CAPTCHA,
         BLOCKED,
-        ABORT
+        ABORT,
+        SKIP
     }
 
     private final Status status;
@@ -41,11 +42,16 @@ public class StepResult {
         return new StepResult(Status.ABORT, message);
     }
 
+    public static StepResult skip(String message) {
+        return new StepResult(Status.SKIP, message);
+    }
+
     public boolean isSuccess() { return status == Status.SUCCESS; }
-    public boolean isFailed() { return status != Status.SUCCESS; }
+    public boolean isFailed() { return status == Status.FAILED || status == Status.CAPTCHA || status == Status.BLOCKED || status == Status.ABORT; }
     public boolean isCaptcha() { return status == Status.CAPTCHA; }
     public boolean isBlocked() { return status == Status.BLOCKED; }
     public boolean isAbort() { return status == Status.ABORT; }
+    public boolean isSkip() { return status == Status.SKIP; }
     public Status getStatus() { return status; }
     public String getMessage() { return message; }
 

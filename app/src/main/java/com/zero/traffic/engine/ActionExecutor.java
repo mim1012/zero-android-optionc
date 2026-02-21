@@ -3,13 +3,13 @@ package com.zero.traffic.engine;
 import android.content.Context;
 import android.content.Intent;
 import android.net.Uri;
-import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.view.MotionEvent;
 import android.webkit.WebResourceError;
 import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 
@@ -44,8 +44,21 @@ public class ActionExecutor {
     // Chrome 폴백 사용 시 true — dwell 스텝에서 WebView 스크롤 대신 단순 대기
     private volatile boolean chromeFallbackUsed = false;
 
+    // Chrome 열릴 때 WebView를 숨기기 위한 콜백 (TrafficService에서 주입)
+    private Runnable onChromeOpenCallback;
+
+    // 서버에서 가져온 헤더 설정 (navigate 시 적용)
+    private com.zero.traffic.model.MobileHeaderConfig mobileHeaders;
+
+    public void setMobileHeaders(com.zero.traffic.model.MobileHeaderConfig headers) {
+        this.mobileHeaders = headers;
+    }
+
     // 현재 탐색 중인 nv_mid — shouldOverrideUrlLoading에서 smartstore 우회 시 사용
     private volatile String currentMid = "";
+
+    // ★ smartstore/brand 인터셉트 시 저장한 실제 목적지 URL (Chrome 오픈에 사용)
+    private volatile String interceptedProductUrl = "";
 
     // ★ HTTP 상태 코드 추적 (onReceivedHttpError에서 설정)
     private volatile int lastHttpStatus = 200;
@@ -67,6 +80,7 @@ public class ActionExecutor {
         lastHttpStatus = 200;
         chromeFallbackUsed = false;
         currentMid = "";
+        interceptedProductUrl = "";
     }
 
     // ── navigate ────────────────────────────────────────
@@ -82,6 +96,7 @@ public class ActionExecutor {
 
         Logger.step(step.getId(), "navigate", url);
         chromeFallbackUsed = false; // 새 네비게이션 시 리셋
+        interceptedProductUrl = "";
         lastHttpStatus = 200; // HTTP 상태 리셋
 
         // ★ 인간적 pre-navigation 딜레이 (즉시 연속 요청 방지)
@@ -100,12 +115,12 @@ public class ActionExecutor {
 
                 @Override
                 public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                    view.evaluateJavascript(STEALTH_JS, null);
+                    view.evaluateJavascript(getActiveStealthJS(), null);
                 }
 
                 @Override
                 public void onPageFinished(WebView view, String loadedUrl) {
-                    view.evaluateJavascript(STEALTH_JS, null);
+                    view.evaluateJavascript(getActiveStealthJS(), null);
                     if (!future.isDone()) {
                         future.complete(null);
                     }
@@ -142,6 +157,7 @@ public class ActionExecutor {
                         (url.contains("smartstore.naver.com") || url.contains("brand.naver.com"))) {
                         Logger.i("★ smartstore 요청 차단 (HTTP 전): " + url.substring(0, Math.min(80, url.length())));
                         chromeFallbackUsed = true;
+                        interceptedProductUrl = url;
                         return new android.webkit.WebResourceResponse("text/html", "UTF-8",
                             new java.io.ByteArrayInputStream("".getBytes()));
                     }
@@ -179,13 +195,14 @@ public class ActionExecutor {
                     if (url.contains("smartstore.naver.com") || url.contains("brand.naver.com")) {
                         Logger.i("smartstore 감지 → Chrome 전환 예약 (IP 회전 후 열기)");
                         chromeFallbackUsed = true;
+                        interceptedProductUrl = url;
                         return true; // WebView 네비게이션 취소
                     }
                     return false;
                 }
             });
 
-            webView.loadUrl(url);
+            webView.loadUrl(url, buildNavHeaders(url));
         });
 
         try {
@@ -492,15 +509,18 @@ public class ActionExecutor {
             String pageState = detectPageState();
             if (isBlockedState(pageState)) {
                 Logger.w("clickProduct: " + pageState + " 감지 → IP 회전 후 Chrome 폴백");
-                if (!mid.isEmpty()) {
-                    quickRotateIP();
-                    openInChrome("https://msearch.shopping.naver.com/product/" + mid);
+                String targetUrl;
+                if (!interceptedProductUrl.isEmpty()) {
+                    targetUrl = interceptedProductUrl;
                 } else if (!href.isEmpty()) {
-                    quickRotateIP();
-                    openInChrome(href);
+                    targetUrl = href;
+                } else if (!mid.isEmpty()) {
+                    targetUrl = "https://msearch.shopping.naver.com/catalog/" + mid;
                 } else {
                     return StepResult.blocked();
                 }
+                quickRotateIP();
+                openInChrome(targetUrl);
                 chromeFallbackUsed = true;
                 return StepResult.success();
             }
@@ -536,6 +556,7 @@ public class ActionExecutor {
             pressHome();
             RandomDelay.sleepBetween(500, 1000);
             chromeFallbackUsed = false;
+            interceptedProductUrl = "";
             return StepResult.success();
         }
 
@@ -622,9 +643,67 @@ public class ActionExecutor {
         int maxPages = step.getInt("maxPages", 5);
         if (mid.isEmpty()) return StepResult.fail("findMid: mid empty");
 
+        String keyword = step.getString("keyword", ""); // 쇼핑 검색 폴백용
+
         Logger.step(step.getId(), "findMid", "mid=" + mid);
         chromeFallbackUsed = false;
+        interceptedProductUrl = "";
         currentMid = mid;
+
+        // ★ 진단: 현재 URL + 페이지 제목
+        String diagUrl = evalJSSync("window.location.href", 3000);
+        String diagTitle = evalJSSync("document.title", 3000);
+        Logger.i("findMid 시작: url=" + diagUrl + " title=" + diagTitle);
+
+        // ★ 일반 네이버 검색 페이지 → 쇼핑 검색으로 이동 (keyword 있을 때)
+        // 랜딩 → m.search.naver.com 으로 리다이렉트되면 쇼핑 컴포넌트 없을 수 있음
+        if (!keyword.isEmpty() && diagUrl != null && diagUrl.contains("m.search.naver.com")) {
+            String shoppingSearchUrl = "https://msearch.shopping.naver.com/search/all?query="
+                    + android.net.Uri.encode(keyword);
+            Logger.i("findMid: 일반 검색 감지 → 쇼핑 검색 이동: " + keyword);
+            CompletableFuture<Void> shopNav = new CompletableFuture<>();
+            mainHandler.post(() -> {
+                if (isWebViewDestroyed()) { shopNav.complete(null); return; }
+                webView.setWebViewClient(new WebViewClient() {
+                    @Override
+                    public void onPageStarted(WebView view, String u, android.graphics.Bitmap fav) {
+                        view.evaluateJavascript(getActiveStealthJS(), null);
+                    }
+                    @Override
+                    public void onPageFinished(WebView view, String loadedUrl) {
+                        view.evaluateJavascript(getActiveStealthJS(), null);
+                        if (!shopNav.isDone()) shopNav.complete(null);
+                    }
+                    @Override
+                    public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                        String u = req.getUrl().toString();
+                        if (req.isForMainFrame() &&
+                            (u.contains("smartstore.naver.com") || u.contains("brand.naver.com"))) {
+                            chromeFallbackUsed = true;
+                            interceptedProductUrl = u;
+                            return new WebResourceResponse("text/html", "UTF-8",
+                                new java.io.ByteArrayInputStream("".getBytes()));
+                        }
+                        return null;
+                    }
+                    @Override
+                    public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest req) {
+                        String u = req.getUrl().toString();
+                        if (u.contains("smartstore.naver.com") || u.contains("brand.naver.com")) {
+                            chromeFallbackUsed = true;
+                            interceptedProductUrl = u;
+                            return true;
+                        }
+                        return false;
+                    }
+                });
+                webView.loadUrl(shoppingSearchUrl);
+            });
+            try { shopNav.get(15000, TimeUnit.MILLISECONDS); } catch (Exception ignored) {}
+            RandomDelay.sleepBetween(1000, 1500);
+            diagUrl = evalJSSync("window.location.href", 3000);
+            Logger.i("findMid: 쇼핑 검색 이동 완료: " + diagUrl);
+        }
 
         // ★ 검색 자동완성/추천 오버레이 제거
         evalJSSync(
@@ -646,6 +725,10 @@ public class ActionExecutor {
             "if(c){el=c.previousElementSibling;" +
             "while(el&&el.tagName!=='A')el=el.previousElementSibling;" +
             "if(!el)el=c.closest('a');s=3;}}" +
+            // 전략 4: data-shp-contents-id (통합검색 쇼핑 섹션)
+            "if(!el){el=document.querySelector('a[data-shp-contents-id=\"'+mid+'\"]');s=4;}" +
+            // 전략 5: /catalog/<mid> URL (msearch.shopping.naver.com/catalog/)
+            "if(!el){el=document.querySelector('a[href*=\"/catalog/'+mid+'\"]');s=5;}" +
             "if(!el)return 'not_found';" +
             "el.removeAttribute('target');" +
             "el.scrollIntoView({block:'center',behavior:'smooth'});" +
@@ -662,6 +745,8 @@ public class ActionExecutor {
             // 진단: 쇼핑 영역의 페이지네이션 정보 수집
             "var items=document.querySelectorAll('[data-shp-contents-id]');" +
             "var itemCount=items.length;" +
+            // ★ 쇼핑 컴포넌트가 없으면 즉시 종료 (웹검색 탭 페이지네이션 오클릭 방지)
+            "if(itemCount===0)return JSON.stringify({type:'not_found',items:0,numBtns:''});" +
             // 방법 1: 쇼핑 영역 근처의 숫자 페이지 버튼 찾기
             // 페이지 버튼은 보통 작은 크기(width<80)이고 숫자만 표시
             "var allEls=document.querySelectorAll('a,button');" +
@@ -669,15 +754,20 @@ public class ActionExecutor {
             "for(var i=0;i<allEls.length;i++){" +
             "  var t=allEls[i].textContent.trim();" +
             "  if(t===String(target)){" +
+            // ★ 웹검색 탭 페이지네이션 링크 제외 (where=m_web, sm=mtb_pge 등)
+            "    if(allEls[i].tagName==='A'){" +
+            "      var h=allEls[i].getAttribute('href')||'';" +
+            "      if(h.indexOf('where=')>=0||h.indexOf('sm=mtb_pge')>=0||h.indexOf('page=')>=0)continue;" +
+            "    }" +
             "    var r=allEls[i].getBoundingClientRect();" +
             "    if(r.width>0&&r.width<80&&r.height>0&&r.height<80){" +
             "      candidates.push({el:allEls[i],y:r.top});" +
             "    }" +
             "  }" +
             "}" +
-            // 후보 중 가장 아래쪽(쇼핑 섹션 하단)의 것을 선택
+            // ★ 후보 중 가장 위쪽(쇼핑 컴포넌트 = 페이지 중간)의 것을 선택
             "if(candidates.length>0){" +
-            "  candidates.sort(function(a,b){return b.y-a.y;});" +
+            "  candidates.sort(function(a,b){return a.y-b.y;});" +
             "  var btn=candidates[0].el;" +
             "  btn.scrollIntoView({block:'center',behavior:'smooth'});" +
             "  btn.click();" +
@@ -687,6 +777,11 @@ public class ActionExecutor {
             "for(var i=0;i<allEls.length;i++){" +
             "  var t=allEls[i].textContent.trim();" +
             "  if((t==='다음'||t==='다음 페이지'||t==='다음페이지')&&!allEls[i].disabled){" +
+            // ★ 웹검색 "다음" 링크 제외 (href에 where= 또는 page= 포함)
+            "    if(allEls[i].tagName==='A'){" +
+            "      var h2=allEls[i].getAttribute('href')||'';" +
+            "      if(h2.indexOf('where=')>=0||h2.indexOf('sm=mtb_pge')>=0||h2.indexOf('page=')>=0)continue;" +
+            "    }" +
             "    var r=allEls[i].getBoundingClientRect();" +
             "    if(r.width>0){" +
             "      allEls[i].scrollIntoView({block:'center',behavior:'smooth'});" +
@@ -736,8 +831,41 @@ public class ActionExecutor {
                     String type = cr.optString("type", "");
                     if ("not_found".equals(type)) {
                         String numBtns = cr.optString("numBtns", "");
-                        Logger.i("findMid: 페이지 " + page + " 버튼 없음 (숫자버튼: " + numBtns + ") — 탐색 종료");
-                        break;
+                        int pgItems = cr.optInt("items", -1);
+                        // ★ 쇼핑 컴포넌트 자체가 없으면 (items=0) 더보기 시도 생략 → 즉시 종료
+                        if (pgItems == 0) {
+                            Logger.i("findMid: 쇼핑 컴포넌트 없음 (items=0) — 탐색 종료");
+                            break;
+                        }
+                        // ★ Phase 4: 더보기 버튼 폴백 (가격비교 컴포넌트 추가 로드)
+                        String moreResult = evalJSSync(
+                            "(function(){" +
+                            "var kw=['더보기','더 보기','전체보기'];" +
+                            "var btns=document.querySelectorAll('button,a,[role=\"button\"]');" +
+                            "for(var i=0;i<btns.length;i++){" +
+                            "  var t=(btns[i].textContent||'').trim();" +
+                            "  for(var k=0;k<kw.length;k++){" +
+                            "    if(t.indexOf(kw[k])>=0){" +
+                            "      var r=btns[i].getBoundingClientRect();" +
+                            "      if(r.width>0&&r.height>0){" +
+                            "        btns[i].scrollIntoView({block:'center',behavior:'smooth'});" +
+                            "        btns[i].click();" +
+                            "        return 'clicked:'+t;" +
+                            "      }" +
+                            "    }" +
+                            "  }" +
+                            "}" +
+                            "return 'none';" +
+                            "})()", 3000);
+                        Logger.i("findMid: 더보기 결과: " + moreResult);
+                        if (moreResult != null && moreResult.startsWith("clicked:")) {
+                            Logger.i("findMid: 더보기 클릭 → 추가 항목 대기 후 재탐색");
+                            RandomDelay.sleepBetween(1500, 2000);
+                            // break 생략 → scan loop 진행
+                        } else {
+                            Logger.i("findMid: 더보기 없음 (숫자버튼: " + numBtns + ") — 탐색 종료");
+                            break;
+                        }
                     }
                     Logger.i("findMid: 페이지 " + page + " 클릭 완료 (방식: " + type + ")");
                 } catch (Exception e) {
@@ -768,8 +896,11 @@ public class ActionExecutor {
 
                         // ★ shouldInterceptRequest/shouldOverrideUrlLoading에서 smartstore 감지
                         if (chromeFallbackUsed) {
-                            Logger.i("findMid: smartstore 감지 → Chrome 직접 열기 (IP 회전 불필요)");
-                            openInChrome("https://msearch.shopping.naver.com/product/" + mid);
+                            String targetUrl = !interceptedProductUrl.isEmpty()
+                                ? interceptedProductUrl
+                                : "https://msearch.shopping.naver.com/catalog/" + mid;
+                            Logger.i("findMid: smartstore 감지 → Chrome 직접 열기: " + targetUrl.substring(0, Math.min(80, targetUrl.length())));
+                            openInChrome(targetUrl);
                             return StepResult.success();
                         }
 
@@ -781,8 +912,11 @@ public class ActionExecutor {
 
                         // ★ 리다이렉트 후 smartstore 감지 확인
                         if (chromeFallbackUsed) {
-                            Logger.i("findMid: 리다이렉트 후 smartstore 감지 → Chrome 직접 열기");
-                            openInChrome("https://msearch.shopping.naver.com/product/" + mid);
+                            String targetUrl = !interceptedProductUrl.isEmpty()
+                                ? interceptedProductUrl
+                                : "https://msearch.shopping.naver.com/catalog/" + mid;
+                            Logger.i("findMid: 리다이렉트 후 smartstore 감지 → Chrome: " + targetUrl.substring(0, Math.min(80, targetUrl.length())));
+                            openInChrome(targetUrl);
                             return StepResult.success();
                         }
 
@@ -791,8 +925,28 @@ public class ActionExecutor {
                         Logger.i("findMid: 페이지 상태: " + pageState);
 
                         if ("product".equals(pageState)) {
+                            // ★ Phase 3: DOM 실제 로드 검증 + 실제 URL 획득
                             String afterUrl = evalJSSync("(function(){return window.location.href;})()", 3000);
-                            Logger.i("findMid: 상품 페이지 로드 성공: " + afterUrl);
+                            String domCheck = evalJSSync(
+                                "(function(){" +
+                                "var s='[class*=\"product_title\"],[class*=\"prd_name\"],[class*=\"price_area\"]," +
+                                "[class*=\"productInfo\"],[class*=\"product_price\"],[class*=\"prdName\"]," +
+                                "[class*=\"prod_name\"],[class*=\"prod_price\"],[id*=\"PRODUCT\"]';" +
+                                "return document.querySelector(s)?'ok':'no_dom';" +
+                                "})()", 3000);
+                            Logger.i("findMid: 상품 페이지 DOM=" + domCheck + " url=" + afterUrl);
+
+                            // ★ 상품 페이지 항상 Chrome으로 열기 (WebView alpha=0 투명 → 사용자에게 보이게)
+                            // afterUrl = WebView가 실제 로드한 URL (smartstore/catalog 등)
+                            // 없으면 mid 기반 catalog URL로 폴백
+                            String chromeUrl = (afterUrl != null && !afterUrl.isEmpty()
+                                    && !afterUrl.equals("null")
+                                    && !afterUrl.startsWith("about:")
+                                    && !afterUrl.contains("search.naver.com"))
+                                ? afterUrl
+                                : "https://msearch.shopping.naver.com/catalog/" + mid;
+                            openInChrome(chromeUrl);
+                            chromeFallbackUsed = true;
                             return StepResult.success();
                         }
 
@@ -852,7 +1006,23 @@ public class ActionExecutor {
             }
         }
 
-        return StepResult.fail("findMid: MID not found after " + maxPages + " pages");
+        // ★ 실패 진단: 페이지에 실제로 어떤 nv_mid 링크가 있는지 덤프
+        String diagLinks = evalJSSync(
+            "(function(){" +
+            "var url=window.location.href;" +
+            "var links=document.querySelectorAll('a[href]');" +
+            "var nv=[];" +
+            "for(var i=0;i<links.length;i++){" +
+            "  var h=links[i].href||'';" +
+            "  if(h.includes('nv_mid')||h.includes('/products/')||h.includes('shopping.naver')){" +
+            "    nv.push(h.substring(0,120));" +
+            "    if(nv.length>=5)break;" +
+            "  }" +
+            "}" +
+            "return JSON.stringify({url:url,total:links.length,nv:nv});})();",
+            5000);
+        Logger.w("findMid 스킵: MID not found after " + maxPages + " pages → 다음 작업으로");
+        return StepResult.skip("findMid: MID not found");
     }
 
     // ═══════════════════════════════════════════════════
@@ -904,9 +1074,10 @@ public class ActionExecutor {
                 "if(t.includes('자동입력방지')" +
                 "||(t.includes('보안 확인')&&(t.includes('영수증')||t.includes('무엇입니까'))))" +
                 "return 'STATE:captcha|URL:'+url+'|T:'+title;" +
-                // 상품 페이지 감지 (smartstore / brand / msearch product)
+                // 상품 페이지 감지 (smartstore / brand / msearch product / catalog)
                 "if(url.includes('smartstore.naver.com')||url.includes('brand.naver.com')" +
-                "||url.includes('/products/')||url.includes('msearch.shopping.naver.com/product/')) return 'product';" +
+                "||url.includes('/products/')||url.includes('msearch.shopping.naver.com/product/')" +
+                "||url.includes('msearch.shopping.naver.com/catalog/')) return 'product';" +
                 // 검색 결과 페이지
                 "if(url.includes('search.shopping.naver.com')||url.includes('msearch.shopping.naver.com')) return 'search';" +
                 "return 'STATE:unknown|URL:'+url+'|T:'+title;})()";
@@ -927,45 +1098,65 @@ public class ActionExecutor {
     }
 
     /**
-     * Chrome Custom Tabs로 URL 열기 (Chrome의 HTTP/2 스택 사용)
-     * nfront 429는 HTTP/2 fingerprint 기반이므로 Chrome만 통과 가능
+     * Chrome으로 URL 열기 (nfront 차단 우회용)
+     * Service 컨텍스트에서는 직접 Intent가 Custom Tabs보다 신뢰성 높음
      */
     private void openInChrome(String url) {
+        // ★ WebView 오버레이 숨기기 — Chrome이 화면에 보이도록
+        if (onChromeOpenCallback != null) {
+            mainHandler.post(onChromeOpenCallback);
+        }
+
         try {
-            // Chrome Custom Tabs (앱 내에서 Chrome 렌더링)
-            CustomTabsIntent customTabsIntent = new CustomTabsIntent.Builder()
-                    .setShowTitle(true)
-                    .build();
-            customTabsIntent.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            customTabsIntent.launchUrl(context, Uri.parse(url));
-            Logger.i("Chrome Custom Tabs 열림: " + url.substring(0, Math.min(80, url.length())));
+            // ★ 직접 Chrome Intent (Service에서 Custom Tabs보다 신뢰성 높음)
+            // FLAG_ACTIVITY_CLEAR_TOP: 기존 Chrome 창에 새 URL 로드 보장
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+            intent.setPackage("com.android.chrome");
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+            context.startActivity(intent);
+            Logger.i("Chrome 열림: " + url.substring(0, Math.min(80, url.length())));
         } catch (Exception e) {
-            Logger.w("Chrome Custom Tabs 실패 → Chrome Intent 폴백: " + e.getMessage());
+            Logger.w("Chrome 직접 실행 실패 → Custom Tabs 폴백: " + e.getMessage());
             try {
-                // 폴백: Chrome 직접 실행
-                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
-                intent.setPackage("com.android.chrome");
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                context.startActivity(intent);
+                CustomTabsIntent customTabsIntent = new CustomTabsIntent.Builder()
+                        .setShowTitle(true)
+                        .build();
+                customTabsIntent.intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                customTabsIntent.launchUrl(context, Uri.parse(url));
             } catch (Exception e2) {
                 // 최종 폴백: 기본 브라우저
-                Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                context.startActivity(intent);
+                Intent fallback = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
+                fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                context.startActivity(fallback);
             }
         }
     }
 
     /**
      * Chrome 열기 전 빠른 IP 회전 — nfront IP 평판 차단 우회
-     * WebView에서 사용한 IP를 변경하여 Chrome이 새 IP로 접속하도록 함
+     * WRITE_SECURE_SETTINGS로 비행기모드 토글 → 새 LTE IP 취득
+     * (svc data는 앱 UID에서 실행 불가 → Settings.Global 방식 사용)
      */
     private void quickRotateIP() {
         try {
-            Logger.i("★ Chrome 전 IP 회전 시작");
-            Runtime.getRuntime().exec(new String[]{"svc", "data", "disable"}).waitFor();
+            Logger.i("★ Chrome 전 IP 회전 시작 (비행기모드 토글)");
+            android.content.ContentResolver cr = context.getContentResolver();
+
+            // 비행기모드 ON
+            android.provider.Settings.Global.putInt(cr,
+                    android.provider.Settings.Global.AIRPLANE_MODE_ON, 1);
+            Intent airOn = new Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED);
+            airOn.putExtra("state", true);
+            context.sendBroadcast(airOn);
             Thread.sleep(3000);
-            Runtime.getRuntime().exec(new String[]{"svc", "data", "enable"}).waitFor();
+
+            // 비행기모드 OFF
+            android.provider.Settings.Global.putInt(cr,
+                    android.provider.Settings.Global.AIRPLANE_MODE_ON, 0);
+            Intent airOff = new Intent(Intent.ACTION_AIRPLANE_MODE_CHANGED);
+            airOff.putExtra("state", false);
+            context.sendBroadcast(airOff);
+
             // 네트워크 복구 대기
             for (int i = 0; i < 10; i++) {
                 Thread.sleep(1000);
@@ -1082,6 +1273,43 @@ public class ActionExecutor {
      */
     public void markDestroyed() {
         destroyed = true;
+    }
+
+    /** Chrome 열릴 때 WebView 숨기기 콜백 등록 (TrafficService에서 호출) */
+    public void setOnChromeOpenCallback(Runnable callback) {
+        this.onChromeOpenCallback = callback;
+    }
+
+    /** 현재 헤더 설정 기반 Stealth JS 반환 (없으면 기본값) */
+    private String getActiveStealthJS() {
+        if (mobileHeaders != null && mobileHeaders.isValid()) {
+            return StealthConfig.buildStealthJS(
+                mobileHeaders.getChromeVersion(),
+                mobileHeaders.getChromeFullVersion(),
+                mobileHeaders.getDeviceModel()
+            );
+        }
+        return StealthConfig.STEALTH_JS;
+    }
+
+    /** navigate용 추가 HTTP 헤더 빌드 */
+    private java.util.Map<String, String> buildNavHeaders(String url) {
+        java.util.Map<String, String> h = new java.util.LinkedHashMap<>();
+        h.put("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8");
+        h.put("Accept-Language", mobileHeaders != null ? mobileHeaders.getAcceptLanguage()
+                : "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7");
+        h.put("Sec-Fetch-Mode", "navigate");
+        h.put("Sec-Fetch-Dest", "document");
+        h.put("Upgrade-Insecure-Requests", "1");
+        // Sec-Fetch-Site: 첫 진입은 none (직접 입력), 랜딩→네이버는 cross-site
+        if (url.contains("naver.com")) {
+            h.put("Sec-Fetch-Site", "cross-site");
+            h.put("Sec-Fetch-User", "?1");
+        } else {
+            h.put("Sec-Fetch-Site", "none");
+            h.put("Sec-Fetch-User", "?1");
+        }
+        return h;
     }
 
     private String jsQuote(String s) {
